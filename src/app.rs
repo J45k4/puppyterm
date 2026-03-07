@@ -140,7 +140,13 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            move |_, cx| cx.new(|_| PuppyTermView::new(boot)),
+            move |window, cx| {
+                cx.new(|cx| {
+                    let terminal_focus = cx.focus_handle();
+                    terminal_focus.focus(window);
+                    PuppyTermView::new(boot, terminal_focus, cx)
+                })
+            },
         )
         .expect("window should open");
         cx.activate(true);

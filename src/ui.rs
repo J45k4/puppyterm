@@ -1,6 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use gpui::{Context, FontWeight, Render, SharedString, Window, div, prelude::*, px, rgb};
+use gpui::{
+    App, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, Render,
+    SharedString, Timer, Window, div, prelude::*, px, rgb,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -41,10 +44,11 @@ pub struct PuppyTermView {
     live_sessions: HashMap<String, TerminalSessionHandle>,
     live_tunnels: HashMap<String, ManagedTunnel>,
     selected_profile_id: Option<String>,
+    terminal_focus: FocusHandle,
 }
 
 impl PuppyTermView {
-    pub fn new(boot: BootState) -> Self {
+    pub fn new(boot: BootState, terminal_focus: FocusHandle, cx: &mut Context<Self>) -> Self {
         let selected_profile_id = boot
             .system_index
             .profiles
@@ -52,7 +56,7 @@ impl PuppyTermView {
             .or_else(|| boot.app_profiles.first())
             .map(|profile| profile.id.clone());
 
-        Self {
+        let this = Self {
             services: boot.services,
             system_index: boot.system_index,
             app_profiles: boot.app_profiles,
@@ -71,7 +75,27 @@ impl PuppyTermView {
             live_sessions: HashMap::new(),
             live_tunnels: HashMap::new(),
             selected_profile_id,
-        }
+            terminal_focus,
+        };
+
+        cx.spawn(async move |this_entity, cx| {
+            loop {
+                Timer::after(Duration::from_millis(33)).await;
+                let keep_running = this_entity
+                    .update(cx, |this, cx| {
+                        if !this.live_sessions.is_empty() {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        this
     }
 
     fn all_profiles(&self) -> Vec<&HostProfile> {
@@ -87,6 +111,14 @@ impl PuppyTermView {
         self.all_profiles()
             .into_iter()
             .find(|profile| profile.id == selected)
+    }
+
+    fn active_session_handle(&self) -> Option<TerminalSessionHandle> {
+        let tab = self.tabs.get(self.active_tab)?;
+        match &tab.kind {
+            WorkspaceTabKind::Session { session_id } => self.live_sessions.get(session_id).cloned(),
+            _ => None,
+        }
     }
 
     fn add_log(&mut self, message: impl Into<String>) {
@@ -171,6 +203,11 @@ impl PuppyTermView {
         cx.notify();
     }
 
+    fn select_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        self.selected_profile_id = Some(profile_id.to_string());
+        self.open_profile_tab(profile_id, cx);
+    }
+
     fn preview_sftp(&mut self, cx: &mut Context<Self>) {
         let Some(profile) = self.selected_profile().cloned() else {
             return;
@@ -208,12 +245,12 @@ impl PuppyTermView {
                 body,
             },
         });
-        self.active_tab = self.tabs.len() - 1;
+        self.active_tab = self.tabs.len().saturating_sub(1);
         self.add_log(format!("Opened SFTP preview for {}.", profile.display_name));
         cx.notify();
     }
 
-    fn start_session(&mut self, cx: &mut Context<Self>) {
+    fn start_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.selected_profile().cloned() else {
             return;
         };
@@ -229,8 +266,9 @@ impl PuppyTermView {
                         session_id: session_id.clone(),
                     },
                 });
-                self.active_tab = self.tabs.len() - 1;
+                self.active_tab = self.tabs.len().saturating_sub(1);
                 self.live_sessions.insert(session_id, handle);
+                self.terminal_focus.focus(window);
                 self.add_log(format!("Started PTY session for {}.", profile.display_name));
             }
             Err(error) => self.add_log(format!("Session launch failed: {error}")),
@@ -267,7 +305,7 @@ impl PuppyTermView {
             },
         });
         self.tunnels.insert(0, tunnel);
-        self.active_tab = self.tabs.len() - 1;
+        self.active_tab = self.tabs.len().saturating_sub(1);
         self.add_log(format!(
             "Prepared tunnel preview for {}.",
             profile.display_name
@@ -280,9 +318,35 @@ impl PuppyTermView {
         cx.notify();
     }
 
-    fn select_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
-        self.selected_profile_id = Some(profile_id.to_string());
-        self.open_profile_tab(profile_id, cx);
+    fn on_terminal_mouse_down(
+        &mut self,
+        _: &gpui::MouseDownEvent,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.terminal_focus.focus(window);
+    }
+
+    fn on_terminal_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(payload) = terminal_bytes_for_keystroke(event) else {
+            return;
+        };
+        let Some(handle) = self.active_session_handle() else {
+            return;
+        };
+
+        match handle.send_input(&payload) {
+            Ok(()) => cx.stop_propagation(),
+            Err(error) => {
+                self.add_log(format!("Terminal input failed: {error}"));
+                cx.notify();
+            }
+        }
     }
 
     fn render_overview(&self) -> impl IntoElement {
@@ -325,6 +389,7 @@ impl PuppyTermView {
                     .child(format!("ssh available: {}", self.binary_status.ssh))
                     .child(format!("sftp available: {}", self.binary_status.sftp))
                     .child(format!("scp available: {}", self.binary_status.scp))
+                    .child(format!("live sessions: {}", self.live_sessions.len()))
                     .child(format!("live tunnels: {}", self.live_tunnels.len())),
             )
     }
@@ -383,7 +448,12 @@ impl PuppyTermView {
             )))
     }
 
-    fn render_session_tab(&self, session: Option<&TerminalSessionHandle>) -> impl IntoElement {
+    fn render_session_tab(
+        &self,
+        session: Option<&TerminalSessionHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         match session {
             Some(handle) => {
                 let snapshot = handle.snapshot();
@@ -392,18 +462,44 @@ impl PuppyTermView {
                 } else {
                     snapshot.rendered_screen
                 };
+                let focused = self.terminal_focus.is_focused(window);
+
                 div()
                     .id(SharedString::from(format!("session-pane-{}", snapshot.id)))
+                    .track_focus(&self.terminal_focus)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_terminal_mouse_down))
+                    .on_key_down(cx.listener(Self::on_terminal_key_down))
                     .size_full()
                     .p_4()
                     .overflow_scroll()
                     .bg(rgb(0x020617))
+                    .border_1()
+                    .border_color(if focused {
+                        rgb(0x38bdf8)
+                    } else {
+                        rgb(0x1e293b)
+                    })
                     .text_color(rgb(0xe2e8f0))
                     .child(
                         div()
                             .text_sm()
                             .text_color(rgb(0x94a3b8))
                             .child(snapshot.command_preview),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(if focused {
+                                rgb(0x38bdf8)
+                            } else {
+                                rgb(0x64748b)
+                            })
+                            .child(if focused {
+                                "Terminal focused. Typing is sent to the PTY."
+                            } else {
+                                "Click inside the terminal to focus it."
+                            }),
                     )
                     .child(
                         div()
@@ -441,7 +537,7 @@ impl PuppyTermView {
             )
     }
 
-    fn render_active_tab(&self) -> gpui::AnyElement {
+    fn render_active_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tab = self
             .tabs
             .get(self.active_tab)
@@ -462,7 +558,7 @@ impl PuppyTermView {
                 )
                 .into_any_element(),
             WorkspaceTabKind::Session { session_id } => self
-                .render_session_tab(self.live_sessions.get(&session_id))
+                .render_session_tab(self.live_sessions.get(&session_id), window, cx)
                 .into_any_element(),
             WorkspaceTabKind::TextPreview { title, body } => {
                 self.render_text_preview(title, body).into_any_element()
@@ -538,6 +634,12 @@ impl PuppyTermView {
     }
 }
 
+impl Focusable for PuppyTermView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.terminal_focus.clone()
+    }
+}
+
 fn metric_card(title: &str, value: usize) -> impl IntoElement {
     div()
         .p_4()
@@ -558,7 +660,7 @@ fn metric_card(title: &str, value: usize) -> impl IntoElement {
 fn action_button(
     label: &str,
     cx: &mut Context<PuppyTermView>,
-    on_click: impl Fn(&mut PuppyTermView, &mut Context<PuppyTermView>) + 'static,
+    on_click: impl Fn(&mut PuppyTermView, &mut Window, &mut Context<PuppyTermView>) + 'static,
 ) -> impl IntoElement {
     div()
         .id(SharedString::from(format!("button-{label}")))
@@ -569,12 +671,67 @@ fn action_button(
         .text_color(rgb(0xf8fafc))
         .cursor_pointer()
         .hover(|this| this.bg(rgb(0x2563eb)))
-        .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
+        .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
         .child(label.to_string())
 }
 
+fn terminal_bytes_for_keystroke(event: &KeyDownEvent) -> Option<String> {
+    let keystroke = &event.keystroke;
+    let key = keystroke.key.to_lowercase();
+
+    match key.as_str() {
+        "enter" => return Some("\r".into()),
+        "tab" if keystroke.modifiers.shift => return Some("\u{1b}[Z".into()),
+        "tab" => return Some("\t".into()),
+        "backspace" => return Some("\u{7f}".into()),
+        "escape" => return Some("\u{1b}".into()),
+        "up" => return Some("\u{1b}[A".into()),
+        "down" => return Some("\u{1b}[B".into()),
+        "right" => return Some("\u{1b}[C".into()),
+        "left" => return Some("\u{1b}[D".into()),
+        "home" => return Some("\u{1b}[H".into()),
+        "end" => return Some("\u{1b}[F".into()),
+        "delete" => return Some("\u{1b}[3~".into()),
+        "pageup" => return Some("\u{1b}[5~".into()),
+        "pagedown" => return Some("\u{1b}[6~".into()),
+        _ => {}
+    }
+
+    if keystroke.modifiers.platform {
+        return None;
+    }
+
+    if keystroke.modifiers.control && !keystroke.modifiers.alt {
+        let byte = match key.as_str() {
+            "space" => 0,
+            "[" => 27,
+            "\\" => 28,
+            "]" => 29,
+            "^" => 30,
+            "_" => 31,
+            _ => {
+                let ch = keystroke.key.chars().next()?;
+                if !ch.is_ascii_alphabetic() {
+                    return None;
+                }
+                ch.to_ascii_lowercase() as u8 - b'a' + 1
+            }
+        };
+        return Some((byte as char).to_string());
+    }
+
+    if let Some(text) = keystroke.key_char.as_ref() {
+        if keystroke.modifiers.alt {
+            return Some(format!("\u{1b}{text}"));
+        }
+        return Some(text.clone());
+    }
+
+    None
+}
+
 impl Render for PuppyTermView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let system_profiles = self.system_index.profiles.clone();
         let app_profiles = self.app_profiles.clone();
         let selected_profile = self.selected_profile().cloned();
@@ -618,10 +775,10 @@ impl Render for PuppyTermView {
                                     .mt_3()
                                     .flex()
                                     .gap_2()
-                                    .child(action_button("Refresh", cx, |this, cx| {
+                                    .child(action_button("Refresh", cx, |this, _, cx| {
                                         this.refresh(cx)
                                     }))
-                                    .child(action_button("Import", cx, |this, cx| {
+                                    .child(action_button("Import", cx, |this, _, cx| {
                                         this.import_selected_profile(cx)
                                     })),
                             )
@@ -680,22 +837,26 @@ impl Render for PuppyTermView {
                                                     .child(action_button(
                                                         "Open Session",
                                                         cx,
-                                                        |this, cx| this.start_session(cx),
+                                                        |this, window, cx| {
+                                                            this.start_session(window, cx)
+                                                        },
                                                     ))
                                                     .child(action_button(
                                                         "SFTP Preview",
                                                         cx,
-                                                        |this, cx| this.preview_sftp(cx),
+                                                        |this, _, cx| this.preview_sftp(cx),
                                                     ))
                                                     .child(action_button(
                                                         "Tunnel Preview",
                                                         cx,
-                                                        |this, cx| this.preview_tunnel(cx),
+                                                        |this, _, cx| this.preview_tunnel(cx),
                                                     ))
                                                     .child(action_button(
                                                         "Refresh Output",
                                                         cx,
-                                                        |this, cx| this.refresh_session_output(cx),
+                                                        |this, _, cx| {
+                                                            this.refresh_session_output(cx)
+                                                        },
                                                     )),
                                             )
                                             .child(
@@ -741,7 +902,7 @@ impl Render for PuppyTermView {
                                             .child(tab.title.clone())
                                     })),
                             )
-                            .child(div().flex_1().child(self.render_active_tab())),
+                            .child(div().flex_1().child(self.render_active_tab(window, cx))),
                     )
                     .child(
                         div()
