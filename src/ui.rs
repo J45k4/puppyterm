@@ -463,6 +463,11 @@ impl PuppyTermView {
                     snapshot.rendered_screen
                 };
                 let focused = self.terminal_focus.is_focused(window);
+                let screen = if focused && !snapshot.hide_cursor {
+                    render_terminal_cursor(&screen, snapshot.cursor_row, snapshot.cursor_col)
+                } else {
+                    screen
+                };
 
                 div()
                     .id(SharedString::from(format!("session-pane-{}", snapshot.id)))
@@ -728,6 +733,36 @@ fn terminal_bytes_for_keystroke(event: &KeyDownEvent) -> Option<String> {
     }
 
     None
+}
+
+fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
+    let mut lines = if screen.is_empty() {
+        vec![String::new()]
+    } else {
+        screen.lines().map(ToOwned::to_owned).collect::<Vec<_>>()
+    };
+
+    let row = usize::from(row);
+    let col = usize::from(col);
+
+    while lines.len() <= row {
+        lines.push(String::new());
+    }
+
+    let line = &mut lines[row];
+    let current_len = line.chars().count();
+    if current_len < col {
+        line.push_str(&" ".repeat(col - current_len));
+    }
+
+    let mut chars = line.chars().collect::<Vec<_>>();
+    if col < chars.len() {
+        chars[col] = '█';
+    } else {
+        chars.push('█');
+    }
+    *line = chars.into_iter().collect();
+    lines.join("\n")
 }
 
 impl Render for PuppyTermView {

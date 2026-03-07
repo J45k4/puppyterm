@@ -40,6 +40,9 @@ pub struct SessionSnapshot {
     pub command_preview: String,
     pub raw_output: String,
     pub rendered_screen: String,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub hide_cursor: bool,
     pub exit_status: Option<i32>,
 }
 
@@ -120,6 +123,9 @@ impl TerminalService {
             command_preview: preview,
             raw_output: String::new(),
             rendered_screen: String::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            hide_cursor: false,
             exit_status: None,
         }));
 
@@ -171,6 +177,10 @@ fn apply_terminal_bytes(snapshot: &mut SessionSnapshot, parser: &mut vt100::Pars
         snapshot.raw_output.drain(..split_at);
     }
     snapshot.rendered_screen = parser.screen().contents().to_string();
+    let (row, col) = parser.screen().cursor_position();
+    snapshot.cursor_row = row;
+    snapshot.cursor_col = col;
+    snapshot.hide_cursor = parser.screen().hide_cursor();
 }
 
 #[cfg(test)]
@@ -186,11 +196,15 @@ mod tests {
             command_preview: "echo hi".into(),
             raw_output: String::new(),
             rendered_screen: String::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            hide_cursor: false,
             exit_status: None,
         };
 
         apply_terminal_bytes(&mut snapshot, &mut parser, b"hello \x1b[31mred\x1b[m");
         assert!(snapshot.raw_output.contains("hello"));
         assert!(snapshot.rendered_screen.contains("hello red"));
+        assert!(!snapshot.hide_cursor);
     }
 }
