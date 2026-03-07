@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, Render,
-    SharedString, Timer, Window, div, prelude::*, px, rgb,
+    App, Context, CursorStyle, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Timer, Window, div,
+    prelude::*, px, rgb,
 };
 use uuid::Uuid;
 
@@ -29,6 +30,12 @@ struct WorkspaceTab {
     kind: WorkspaceTabKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivePaneResize {
+    Sidebar,
+    Detail,
+}
+
 pub struct PuppyTermView {
     services: Arc<PuppyTermServices>,
     system_index: SystemProfileIndex,
@@ -45,6 +52,9 @@ pub struct PuppyTermView {
     live_tunnels: HashMap<String, ManagedTunnel>,
     selected_profile_id: Option<String>,
     terminal_focus: FocusHandle,
+    sidebar_width: Pixels,
+    detail_width: Pixels,
+    active_resize: Option<ActivePaneResize>,
 }
 
 impl PuppyTermView {
@@ -76,6 +86,9 @@ impl PuppyTermView {
             live_tunnels: HashMap::new(),
             selected_profile_id,
             terminal_focus,
+            sidebar_width: px(300.0),
+            detail_width: px(340.0),
+            active_resize: None,
         };
 
         cx.spawn(async move |this_entity, cx| {
@@ -203,6 +216,47 @@ impl PuppyTermView {
         cx.notify();
     }
 
+    fn tab_is_closable(tab: &WorkspaceTab) -> bool {
+        !matches!(tab.kind, WorkspaceTabKind::Overview)
+    }
+
+    fn close_tab(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+        if tab_index >= self.tabs.len() {
+            return;
+        }
+
+        let tab = self.tabs[tab_index].clone();
+        if !Self::tab_is_closable(&tab) {
+            return;
+        }
+
+        if let WorkspaceTabKind::Session { session_id } = &tab.kind {
+            if let Some(handle) = self.live_sessions.remove(session_id) {
+                if let Err(error) = handle.terminate() {
+                    self.add_log(format!("Session shutdown failed: {error}"));
+                }
+            }
+        }
+
+        self.tabs.remove(tab_index);
+
+        if self.tabs.is_empty() {
+            self.tabs.push(WorkspaceTab {
+                id: "overview".into(),
+                title: "Overview".into(),
+                kind: WorkspaceTabKind::Overview,
+            });
+            self.active_tab = 0;
+        } else if self.active_tab > tab_index {
+            self.active_tab -= 1;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        }
+
+        self.add_log(format!("Closed tab {}.", tab.title));
+        cx.notify();
+    }
+
     fn select_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
         self.selected_profile_id = Some(profile_id.to_string());
         self.open_profile_tab(profile_id, cx);
@@ -315,6 +369,52 @@ impl PuppyTermView {
 
     fn refresh_session_output(&mut self, cx: &mut Context<Self>) {
         self.add_log("Refreshed session snapshots.");
+        cx.notify();
+    }
+
+    fn begin_sidebar_resize(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.active_resize = Some(ActivePaneResize::Sidebar);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn begin_detail_resize(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.active_resize = Some(ActivePaneResize::Detail);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn end_resize(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_resize.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn on_root_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_resize) = self.active_resize else {
+            return;
+        };
+        if !event.dragging() {
+            self.active_resize = None;
+            cx.notify();
+            return;
+        }
+
+        let viewport_width = window.viewport_size().width;
+        match active_resize {
+            ActivePaneResize::Sidebar => {
+                self.sidebar_width = clamp_pixels(event.position.x, px(220.0), px(520.0));
+            }
+            ActivePaneResize::Detail => {
+                let width = viewport_width - event.position.x;
+                self.detail_width = clamp_pixels(width, px(260.0), px(560.0));
+            }
+        }
         cx.notify();
     }
 
@@ -765,6 +865,10 @@ fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
     lines.join("\n")
 }
 
+fn clamp_pixels(value: Pixels, min: Pixels, max: Pixels) -> Pixels {
+    value.max(min).min(max)
+}
+
 impl Render for PuppyTermView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let system_profiles = self.system_index.profiles.clone();
@@ -783,6 +887,9 @@ impl Render for PuppyTermView {
 
         div()
             .size_full()
+            .on_mouse_move(cx.listener(Self::on_root_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::end_resize))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_resize))
             .bg(rgb(0x030712))
             .text_color(rgb(0xe2e8f0))
             .child(
@@ -792,13 +899,11 @@ impl Render for PuppyTermView {
                     .child(
                         div()
                             .id("sidebar-scroll")
-                            .w(px(300.0))
+                            .w(self.sidebar_width)
                             .h_full()
                             .p_4()
                             .overflow_scroll()
                             .bg(rgb(0x111827))
-                            .border_r_1()
-                            .border_color(rgb(0x1f2937))
                             .child(
                                 div()
                                     .text_2xl()
@@ -846,6 +951,23 @@ impl Render for PuppyTermView {
                                     .flex_col()
                                     .gap_2()
                                     .children(app_profile_rows),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-resize-handle")
+                            .w(px(8.0))
+                            .h_full()
+                            .cursor(CursorStyle::ResizeColumn)
+                            .bg(if self.active_resize == Some(ActivePaneResize::Sidebar) {
+                                rgb(0x38bdf8)
+                            } else {
+                                rgb(0x1f2937)
+                            })
+                            .hover(|this| this.bg(rgb(0x334155)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::begin_sidebar_resize),
                             ),
                     )
                     .child(
@@ -922,6 +1044,8 @@ impl Render for PuppyTermView {
                                     .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                                         let active = self.active_tab == index;
                                         let tab_index = index;
+                                        let close_index = index;
+                                        let closable = Self::tab_is_closable(tab);
                                         div()
                                             .id(SharedString::from(tab.id.clone()))
                                             .px_3()
@@ -934,21 +1058,67 @@ impl Render for PuppyTermView {
                                                 this.active_tab = tab_index;
                                                 cx.notify();
                                             }))
-                                            .child(tab.title.clone())
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(div().text_sm().child(tab.title.clone()))
+                                                    .when(closable, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .id(SharedString::from(format!(
+                                                                    "{}-close",
+                                                                    tab.id
+                                                                )))
+                                                                .px_1()
+                                                                .rounded_sm()
+                                                                .text_color(rgb(0xe2e8f0))
+                                                                .hover(|this| {
+                                                                    this.bg(rgb(0x334155))
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.close_tab(
+                                                                            close_index,
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ))
+                                                                .child("x"),
+                                                        )
+                                                    }),
+                                            )
                                     })),
                             )
                             .child(div().flex_1().child(self.render_active_tab(window, cx))),
                     )
                     .child(
                         div()
+                            .id("detail-resize-handle")
+                            .w(px(8.0))
+                            .h_full()
+                            .cursor(CursorStyle::ResizeColumn)
+                            .bg(if self.active_resize == Some(ActivePaneResize::Detail) {
+                                rgb(0x38bdf8)
+                            } else {
+                                rgb(0x1f2937)
+                            })
+                            .hover(|this| this.bg(rgb(0x334155)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::begin_detail_resize),
+                            ),
+                    )
+                    .child(
+                        div()
                             .id("detail-scroll")
-                            .w(px(340.0))
+                            .w(self.detail_width)
                             .h_full()
                             .p_4()
                             .overflow_scroll()
                             .bg(rgb(0x111827))
-                            .border_l_1()
-                            .border_color(rgb(0x1f2937))
                             .child(
                                 div()
                                     .text_xl()
