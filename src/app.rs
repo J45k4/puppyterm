@@ -190,6 +190,12 @@ pub fn run() {
         })
         .run(|cx: &mut App| {
             set_macos_app_icon();
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
             let boot = BootState::load();
             let bounds = Bounds::centered(None, size(px(1480.0), px(920.0)), cx);
             cx.open_window(

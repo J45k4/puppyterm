@@ -86,6 +86,17 @@ pub struct PuppyTermView {
     sftp_browsers: HashMap<String, SftpBrowserState>,
 }
 
+impl Drop for PuppyTermView {
+    fn drop(&mut self) {
+        for handle in self.live_sessions.values() {
+            let _ = handle.terminate();
+        }
+        for tunnel in self.live_tunnels.values() {
+            let _ = tunnel.stop();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SftpBrowserEntry {
     name: String,
