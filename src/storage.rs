@@ -16,6 +16,7 @@ pub trait ProfileRepository: Send + Sync {
     fn upsert_key(&self, key: &StoredKey) -> Result<()>;
     fn list_tunnels(&self) -> Result<Vec<TunnelSpec>>;
     fn upsert_tunnel(&self, tunnel: &TunnelSpec) -> Result<()>;
+    fn delete_tunnel(&self, tunnel_id: &str) -> Result<()>;
     fn recent_sessions(&self) -> Result<Vec<SessionRecord>>;
     fn record_session(&self, session: &SessionRecord) -> Result<()>;
 }
@@ -165,6 +166,13 @@ impl ProfileRepository for SqliteProfileRepository {
         )
     }
 
+    fn delete_tunnel(&self, tunnel_id: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .execute("DELETE FROM tunnels WHERE id = ?1", params![tunnel_id])?;
+        Ok(())
+    }
+
     fn recent_sessions(&self) -> Result<Vec<SessionRecord>> {
         self.load_json("SELECT data FROM sessions ORDER BY started_at DESC LIMIT 25")
     }
@@ -206,7 +214,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ProfileRepository, SqliteProfileRepository};
-    use crate::domain::HostProfile;
+    use crate::domain::{HostProfile, RecordMeta, TunnelMode, TunnelSpec};
 
     #[test]
     fn stores_and_loads_app_profiles() -> Result<()> {
@@ -234,6 +242,31 @@ mod tests {
         assert_eq!(duplicate.source, crate::domain::ProfileSource::AppManaged);
         assert!(duplicate.display_name.contains("Imported"));
         assert_ne!(duplicate.id, profile.id);
+        Ok(())
+    }
+
+    #[test]
+    fn deletes_tunnel_records() -> Result<()> {
+        let temp = tempdir()?;
+        let repo = SqliteProfileRepository::open(temp.path().join("data.sqlite"))?;
+
+        let tunnel = TunnelSpec {
+            id: "tunnel-1".into(),
+            profile_id: "profile-1".into(),
+            name: "Local Forward".into(),
+            mode: TunnelMode::Local,
+            bind_host: "127.0.0.1".into(),
+            bind_port: 8080,
+            target_host: Some("127.0.0.1".into()),
+            target_port: Some(80),
+            meta: RecordMeta::new(),
+        };
+
+        repo.upsert_tunnel(&tunnel)?;
+        assert_eq!(repo.list_tunnels()?.len(), 1);
+
+        repo.delete_tunnel(&tunnel.id)?;
+        assert!(repo.list_tunnels()?.is_empty());
         Ok(())
     }
 }

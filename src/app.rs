@@ -1,7 +1,10 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, fs, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Application, AssetSource, Bounds, SharedString, WindowBounds, WindowOptions,
+    px, size,
+};
 
 use crate::{
     domain::{SessionRecord, StoredKey, SystemProfileIndex, TunnelSpec},
@@ -11,6 +14,8 @@ use crate::{
     storage::{ProfileRepository, SqliteProfileRepository},
     ui::PuppyTermView,
 };
+
+const APP_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/puppyterm.png");
 
 #[derive(Clone)]
 pub struct PuppyTermServices {
@@ -74,6 +79,26 @@ impl BootState {
     }
 }
 
+struct FilesystemAssets {
+    base: PathBuf,
+}
+
+impl AssetSource for FilesystemAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        Ok(Some(Cow::Owned(fs::read(self.base.join(path))?)))
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        Ok(fs::read_dir(self.base.join(path))?
+            .filter_map(|entry| {
+                entry.ok().map(|entry| {
+                    SharedString::from(entry.file_name().to_string_lossy().into_owned())
+                })
+            })
+            .collect())
+    }
+}
+
 fn load_boot_state() -> Result<BootState> {
     let paths = AppPaths::discover()?;
     let secret_store: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new("com.puppyterm.app"));
@@ -131,24 +156,52 @@ fn merge_known_hosts(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn set_macos_app_icon() {
+    use cocoa::{
+        appkit::{NSApp, NSApplication, NSImage},
+        base::{id, nil},
+        foundation::NSString,
+    };
+
+    unsafe {
+        let path = NSString::alloc(nil).init_str(APP_ICON_PATH);
+        let image: id = NSImage::alloc(nil).initByReferencingFile_(path);
+        if image != nil {
+            let app = NSApp();
+            if app != nil {
+                app.setApplicationIconImage_(image);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_macos_app_icon() {}
+
 pub fn run() {
-    Application::new().run(|cx: &mut App| {
-        let boot = BootState::load();
-        let bounds = Bounds::centered(None, size(px(1480.0), px(920.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |window, cx| {
-                cx.new(|cx| {
-                    let terminal_focus = cx.focus_handle();
-                    terminal_focus.focus(window);
-                    PuppyTermView::new(boot, terminal_focus, cx)
-                })
-            },
-        )
-        .expect("window should open");
-        cx.activate(true);
-    });
+    Application::new()
+        .with_assets(FilesystemAssets {
+            base: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        })
+        .run(|cx: &mut App| {
+            set_macos_app_icon();
+            let boot = BootState::load();
+            let bounds = Bounds::centered(None, size(px(1480.0), px(920.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    cx.new(|cx| {
+                        let terminal_focus = cx.focus_handle();
+                        terminal_focus.focus(window);
+                        PuppyTermView::new(boot, terminal_focus, cx)
+                    })
+                },
+            )
+            .expect("window should open");
+            cx.activate(true);
+        });
 }

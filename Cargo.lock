@@ -4069,6 +4069,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "cocoa 0.26.0",
  "dirs 6.0.0",
  "gpui",
  "keyring",

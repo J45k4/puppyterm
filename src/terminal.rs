@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -52,6 +52,8 @@ pub struct TerminalSessionHandle {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    parser: Arc<Mutex<vt100::Parser>>,
 }
 
 impl TerminalSessionHandle {
@@ -60,6 +62,7 @@ impl TerminalSessionHandle {
     }
 
     pub fn send_input(&self, input: &str) -> Result<()> {
+        self.scroll_scrollback(0);
         let mut writer = self.writer.lock();
         writer
             .write_all(input.as_bytes())
@@ -80,10 +83,30 @@ impl TerminalSessionHandle {
     }
 
     pub fn terminate(&self) -> Result<()> {
-        self.child
+        self.killer
             .lock()
             .kill()
             .context("terminating PTY child process")
+    }
+
+    pub fn scroll_scrollback(&self, rows: usize) {
+        let mut parser = self.parser.lock();
+        parser.screen_mut().set_scrollback(rows);
+        let mut snapshot = self.snapshot.lock();
+        sync_snapshot_from_parser(&mut snapshot, &parser);
+    }
+
+    pub fn scroll_scrollback_by(&self, delta_rows: isize) {
+        let mut parser = self.parser.lock();
+        let current = parser.screen().scrollback();
+        let next = if delta_rows >= 0 {
+            current.saturating_add(delta_rows as usize)
+        } else {
+            current.saturating_sub(delta_rows.unsigned_abs())
+        };
+        parser.screen_mut().set_scrollback(next);
+        let mut snapshot = self.snapshot.lock();
+        sync_snapshot_from_parser(&mut snapshot, &parser);
     }
 }
 
@@ -113,6 +136,7 @@ impl TerminalService {
             .slave
             .spawn_command(builder)
             .with_context(|| format!("spawning {}", command.preview()))?;
+        let killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
@@ -128,16 +152,18 @@ impl TerminalService {
             hide_cursor: false,
             exit_status: None,
         }));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(30, 120, 2_000)));
 
         let snapshot_for_reader = Arc::clone(&snapshot);
+        let parser_for_reader = Arc::clone(&parser);
         thread::spawn(move || {
-            let mut parser = vt100::Parser::new(30, 120, 2_000);
             let mut buffer = [0_u8; 4096];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(bytes_read) => {
                         let chunk = &buffer[..bytes_read];
+                        let mut parser = parser_for_reader.lock();
                         let mut snapshot = snapshot_for_reader.lock();
                         apply_terminal_bytes(&mut snapshot, &mut parser, chunk);
                     }
@@ -163,6 +189,8 @@ impl TerminalService {
             writer: Arc::new(Mutex::new(writer)),
             master: Arc::new(Mutex::new(pair.master)),
             child,
+            killer: Arc::new(Mutex::new(killer)),
+            parser,
         })
     }
 }
@@ -176,11 +204,15 @@ fn apply_terminal_bytes(snapshot: &mut SessionSnapshot, parser: &mut vt100::Pars
         let split_at = snapshot.raw_output.len().saturating_sub(24_000);
         snapshot.raw_output.drain(..split_at);
     }
+    sync_snapshot_from_parser(snapshot, parser);
+}
+
+fn sync_snapshot_from_parser(snapshot: &mut SessionSnapshot, parser: &vt100::Parser) {
     snapshot.rendered_screen = parser.screen().contents().to_string();
     let (row, col) = parser.screen().cursor_position();
     snapshot.cursor_row = row;
     snapshot.cursor_col = col;
-    snapshot.hide_cursor = parser.screen().hide_cursor();
+    snapshot.hide_cursor = parser.screen().hide_cursor() || parser.screen().scrollback() > 0;
 }
 
 #[cfg(test)]
