@@ -9,7 +9,7 @@ use gpui::{
 use crate::{
     domain::{SessionRecord, StoredKey, SystemProfileIndex, TunnelSpec},
     interop::scan_default_ssh_assets,
-    platform::{AppPaths, KeyringSecretStore, SecretStore},
+    platform::{AppPaths, HybridSecretStore, SecretStore},
     ssh::{BinaryStatus, OpenSshBackend, SshBackend},
     storage::{ProfileRepository, SqliteProfileRepository},
     ui::PuppyTermView,
@@ -46,9 +46,12 @@ impl BootState {
                     database: std::env::temp_dir().join("puppyterm.sqlite3"),
                     known_hosts: std::env::temp_dir().join("known_hosts"),
                     key_blobs: std::env::temp_dir().join("key_blobs"),
+                    secrets: std::env::temp_dir().join("puppyterm-secrets"),
                 });
                 let secret_store: Arc<dyn SecretStore> =
-                    Arc::new(KeyringSecretStore::new("com.puppyterm.app"));
+                    Arc::new(HybridSecretStore::new("com.puppyterm.app", &paths).expect(
+                        "boot fallback secret store should be creatable",
+                    ));
                 let repository: Arc<dyn ProfileRepository> = Arc::new(
                     SqliteProfileRepository::open(&paths.database)
                         .expect("boot fallback repository should be creatable"),
@@ -101,7 +104,8 @@ impl AssetSource for FilesystemAssets {
 
 fn load_boot_state() -> Result<BootState> {
     let paths = AppPaths::discover()?;
-    let secret_store: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new("com.puppyterm.app"));
+    let secret_store: Arc<dyn SecretStore> =
+        Arc::new(HybridSecretStore::new("com.puppyterm.app", &paths)?);
     let repository: Arc<dyn ProfileRepository> =
         Arc::new(SqliteProfileRepository::open(&paths.database)?);
     let backend: Arc<dyn SshBackend> = Arc::new(OpenSshBackend::new(paths.clone()));

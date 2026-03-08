@@ -409,6 +409,7 @@ mod tests {
             database: std::env::temp_dir().join("puppyterm-test.sqlite"),
             known_hosts: std::env::temp_dir().join("puppyterm-known-hosts"),
             key_blobs: std::env::temp_dir().join("puppyterm-key-blobs"),
+            secrets: std::env::temp_dir().join("puppyterm-secrets"),
         })
     }
 

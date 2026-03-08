@@ -3,14 +3,14 @@ use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
 use gpui::{
     App, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable, FontWeight, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
-    Render, ScrollWheelEvent, SharedString, StyledText, Timer, Window, div, img, prelude::*, px,
-    rgb,
+    Render, ScrollWheelEvent, SharedString, StyledText, TextRun, Timer, Window, div, font, img,
+    prelude::*, px, rgb,
 };
 use uuid::Uuid;
 
 use crate::{
     app::{BootState, PuppyTermServices},
-    domain::{HostProfile, ProfileSource, StoredKey, SystemProfileIndex, TunnelMode, TunnelSpec},
+    domain::{AuthMethod, HostProfile, ProfileSource, StoredKey, SystemProfileIndex, TunnelMode, TunnelSpec},
     interop::scan_default_ssh_assets,
     ssh::{ManagedTunnel, SftpOperation},
     terminal::TerminalSessionHandle,
@@ -21,8 +21,8 @@ const SIDEBAR_LOGO_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/pup
 #[derive(Clone)]
 enum WorkspaceTabKind {
     Menu,
-    ProfilePicker,
     Profile { profile_id: String },
+    SftpBrowser { profile_id: String },
     ProfileEditor { editor_id: String },
     IdentityEditor { editor_id: String },
     Session { session_id: String },
@@ -73,6 +73,7 @@ pub struct PuppyTermView {
     tunnel_editor_focus: FocusHandle,
     tunnel_editors: HashMap<String, TunnelEditorState>,
     tunnel_context_menu: Option<TunnelContextMenuState>,
+    profile_context_menu: Option<ProfileContextMenuState>,
     terminal_selection_session_id: Option<String>,
     terminal_selection_anchor: Option<TerminalGridPoint>,
     terminal_selection_focus: Option<TerminalGridPoint>,
@@ -82,10 +83,7 @@ pub struct PuppyTermView {
     detail_width: Pixels,
     active_resize: Option<ActivePaneResize>,
     selected_menu_section: MenuSection,
-    selected_sftp_profile_id: Option<String>,
-    sftp_browser_path: String,
-    sftp_browser_entries: Vec<SftpBrowserEntry>,
-    sftp_browser_error: Option<String>,
+    sftp_browsers: HashMap<String, SftpBrowserState>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +91,14 @@ struct SftpBrowserEntry {
     name: String,
     is_dir: bool,
     detail: String,
+}
+
+#[derive(Clone, Debug)]
+struct SftpBrowserState {
+    profile_id: String,
+    path: String,
+    entries: Vec<SftpBrowserEntry>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,10 +116,17 @@ enum TunnelFormField {
     TargetPort,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TunnelEditorStep {
+    SelectProfile,
+    Configure,
+}
+
 #[derive(Clone, Debug)]
 struct TunnelEditorState {
     tunnel_id: String,
     existing_tunnel_id: Option<String>,
+    step: TunnelEditorStep,
     name: String,
     profile_id: String,
     mode: TunnelMode,
@@ -132,6 +145,11 @@ struct TunnelContextMenuState {
     tunnel_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct ProfileContextMenuState {
+    profile_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProfileFormField {
     DisplayName,
@@ -139,7 +157,13 @@ enum ProfileFormField {
     Username,
     Port,
     IdentityPath,
-    RemoteDirectory,
+    Password,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileAuthMode {
+    Identity,
+    Password,
 }
 
 #[derive(Clone, Debug)]
@@ -150,8 +174,11 @@ struct ProfileEditorState {
     hostname: String,
     username: String,
     port: String,
+    auth_mode: ProfileAuthMode,
     identity_path: String,
-    remote_directory: String,
+    password: String,
+    password_secret_id: Option<String>,
+    password_revealed: bool,
     focused_field: ProfileFormField,
     cursor_offset: usize,
     select_all: bool,
@@ -225,6 +252,7 @@ impl PuppyTermView {
             tunnel_editor_focus,
             tunnel_editors: HashMap::new(),
             tunnel_context_menu: None,
+            profile_context_menu: None,
             terminal_selection_session_id: None,
             terminal_selection_anchor: None,
             terminal_selection_focus: None,
@@ -234,10 +262,7 @@ impl PuppyTermView {
             detail_width: px(340.0),
             active_resize: None,
             selected_menu_section: MenuSection::Hosts,
-            selected_sftp_profile_id: None,
-            sftp_browser_path: ".".into(),
-            sftp_browser_entries: Vec::new(),
-            sftp_browser_error: None,
+            sftp_browsers: HashMap::new(),
         };
 
         cx.spawn(async move |this_entity, cx| {
@@ -307,7 +332,8 @@ impl PuppyTermView {
         Some(TunnelEditorState {
             tunnel_id: Uuid::new_v4().to_string(),
             existing_tunnel_id: None,
-            name: format!("{} Tunnel", profile.display_name),
+            step: TunnelEditorStep::SelectProfile,
+            name: String::new(),
             profile_id: profile.id.clone(),
             mode: TunnelMode::Local,
             bind_host: "127.0.0.1".into(),
@@ -329,8 +355,11 @@ impl PuppyTermView {
             hostname: String::new(),
             username: String::new(),
             port: "22".into(),
+            auth_mode: ProfileAuthMode::Identity,
             identity_path: String::new(),
-            remote_directory: String::new(),
+            password: String::new(),
+            password_secret_id: None,
+            password_revealed: false,
             focused_field: ProfileFormField::DisplayName,
             cursor_offset: 0,
             select_all: false,
@@ -506,85 +535,109 @@ impl PuppyTermView {
         cx.notify();
     }
 
-    fn selected_sftp_profile(&self) -> Option<&HostProfile> {
-        let selected = self.selected_sftp_profile_id.as_deref()?;
-        self.all_profiles()
-            .into_iter()
-            .find(|profile| profile.id == selected)
+    fn active_sftp_profile_id(&self) -> Option<&str> {
+        let tab = self.tabs.get(self.active_tab)?;
+        match &tab.kind {
+            WorkspaceTabKind::SftpBrowser { profile_id } => Some(profile_id.as_str()),
+            _ => None,
+        }
     }
 
-    fn select_sftp_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
-        self.selected_sftp_profile_id = Some(profile_id.to_string());
-        self.sftp_browser_path = ".".into();
-        self.refresh_sftp_browser(cx);
-    }
-
-    fn refresh_sftp_browser(&mut self, cx: &mut Context<Self>) {
-        let Some(profile) = self.selected_sftp_profile().cloned() else {
-            self.sftp_browser_entries.clear();
-            self.sftp_browser_error = Some("No SFTP profile selected.".into());
+    fn open_sftp_browser(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        if let Some((index, _)) = self.tabs.iter().enumerate().find(|(_, tab)| {
+            matches!(&tab.kind, WorkspaceTabKind::SftpBrowser { profile_id: existing } if existing == profile_id)
+        }) {
+            self.active_tab = index;
             cx.notify();
+            return;
+        }
+
+        let title = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| format!("SFTP {}", profile.display_name))
+            .unwrap_or_else(|| "SFTP".into());
+        self.tabs.push(WorkspaceTab {
+            id: Uuid::new_v4().to_string(),
+            title,
+            kind: WorkspaceTabKind::SftpBrowser {
+                profile_id: profile_id.to_string(),
+            },
+        });
+        self.active_tab = self.tabs.len().saturating_sub(1);
+        self.sftp_browsers
+            .entry(profile_id.to_string())
+            .or_insert_with(|| SftpBrowserState {
+                profile_id: profile_id.to_string(),
+                path: ".".into(),
+                entries: Vec::new(),
+                error: None,
+            });
+        self.refresh_sftp_browser(profile_id, cx);
+    }
+
+    fn refresh_sftp_browser(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
             return;
         };
 
+        let browser = self
+            .sftp_browsers
+            .entry(profile_id.to_string())
+            .or_insert_with(|| SftpBrowserState {
+                profile_id: profile_id.to_string(),
+                path: ".".into(),
+                entries: Vec::new(),
+                error: None,
+            });
+
         let operation = SftpOperation::ListDirectory {
-            path: self.sftp_browser_path.clone(),
+            path: browser.path.clone(),
         };
 
         match self.services.ssh_backend.run_sftp_op(&profile, &operation) {
             Ok(result) => {
-                self.sftp_browser_entries = parse_sftp_entries(&result.stdout);
-                self.sftp_browser_error = if result.success {
+                browser.entries = parse_sftp_entries(&result.stdout);
+                browser.error = if result.success {
                     None
                 } else {
                     Some(result.stderr)
                 };
             }
             Err(error) => {
-                self.sftp_browser_entries.clear();
-                self.sftp_browser_error = Some(error.to_string());
+                browser.entries.clear();
+                browser.error = Some(error.to_string());
             }
         }
         cx.notify();
     }
 
-    fn open_sftp_entry(&mut self, name: &str, cx: &mut Context<Self>) {
+    fn open_sftp_entry(&mut self, profile_id: &str, name: &str, cx: &mut Context<Self>) {
         if name == "." {
             return;
         }
         if name == ".." {
-            self.go_up_sftp_directory(cx);
+            self.go_up_sftp_directory(profile_id, cx);
             return;
         }
 
-        self.sftp_browser_path = join_remote_path(&self.sftp_browser_path, name);
-        self.refresh_sftp_browser(cx);
-    }
-
-    fn go_up_sftp_directory(&mut self, cx: &mut Context<Self>) {
-        self.sftp_browser_path = parent_remote_path(&self.sftp_browser_path);
-        self.refresh_sftp_browser(cx);
-    }
-
-    fn open_profile_picker(&mut self, cx: &mut Context<Self>) {
-        if let Some((index, _)) = self
-            .tabs
-            .iter()
-            .enumerate()
-            .find(|(_, tab)| matches!(tab.kind, WorkspaceTabKind::ProfilePicker))
-        {
-            self.active_tab = index;
-            cx.notify();
-            return;
+        if let Some(browser) = self.sftp_browsers.get_mut(profile_id) {
+            browser.path = join_remote_path(&browser.path, name);
         }
+        self.refresh_sftp_browser(profile_id, cx);
+    }
 
-        self.tabs.push(WorkspaceTab {
-            id: Uuid::new_v4().to_string(),
-            title: "Connect".into(),
-            kind: WorkspaceTabKind::ProfilePicker,
-        });
-        self.active_tab = self.tabs.len().saturating_sub(1);
-        cx.notify();
+    fn go_up_sftp_directory(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        if let Some(browser) = self.sftp_browsers.get_mut(profile_id) {
+            browser.path = parent_remote_path(&browser.path);
+        }
+        self.refresh_sftp_browser(profile_id, cx);
     }
 
     fn open_profile_editor(&mut self, cx: &mut Context<Self>) {
@@ -594,6 +647,65 @@ impl PuppyTermView {
         self.tabs.push(WorkspaceTab {
             id: Uuid::new_v4().to_string(),
             title: "New SSH".into(),
+            kind: WorkspaceTabKind::ProfileEditor { editor_id },
+        });
+        self.active_tab = self.tabs.len().saturating_sub(1);
+        cx.notify();
+    }
+
+    fn open_profile_context_menu(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        self.profile_context_menu = Some(ProfileContextMenuState {
+            profile_id: profile_id.to_string(),
+        });
+        cx.notify();
+    }
+
+    fn edit_profile_config(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self
+            .app_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let (auth_mode, password_secret_id, password) = match &profile.auth_method {
+            AuthMethod::Password { secret_id } => (
+                ProfileAuthMode::Password,
+                Some(secret_id.clone()),
+                String::new(),
+            ),
+            _ => (ProfileAuthMode::Identity, None, String::new()),
+        };
+
+        let editor = ProfileEditorState {
+            editor_id: Uuid::new_v4().to_string(),
+            profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            hostname: profile.hostname.clone(),
+            username: profile.username.clone().unwrap_or_default(),
+            port: profile.port.to_string(),
+            auth_mode,
+            identity_path: profile
+                .identity_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            password,
+            password_secret_id,
+            password_revealed: false,
+            focused_field: ProfileFormField::DisplayName,
+            cursor_offset: profile.display_name.chars().count(),
+            select_all: false,
+            error: None,
+        };
+        let editor_id = editor.editor_id.clone();
+        self.profile_editors.insert(editor_id.clone(), editor);
+        self.profile_context_menu = None;
+        self.tabs.push(WorkspaceTab {
+            id: Uuid::new_v4().to_string(),
+            title: format!("Edit {}", profile.display_name),
             kind: WorkspaceTabKind::ProfileEditor { editor_id },
         });
         self.active_tab = self.tabs.len().saturating_sub(1);
@@ -610,6 +722,63 @@ impl PuppyTermView {
             kind: WorkspaceTabKind::IdentityEditor { editor_id },
         });
         self.active_tab = self.tabs.len().saturating_sub(1);
+        cx.notify();
+    }
+
+    fn open_identity_public_key_preview(&mut self, key_id: &str, cx: &mut Context<Self>) {
+        let key = self
+            .system_index
+            .keys
+            .iter()
+            .chain(self.app_keys.iter())
+            .find(|key| key.id == key_id)
+            .cloned();
+        let Some(key) = key else {
+            return;
+        };
+
+        let title = format!("Public Key {}", key.name);
+        if let Some((index, _)) = self.tabs.iter().enumerate().find(|(_, tab)| {
+            matches!(&tab.kind, WorkspaceTabKind::TextPreview { title: existing, .. } if existing == &title)
+        }) {
+            self.active_tab = index;
+            cx.notify();
+            return;
+        }
+
+        let body = identity_public_key_preview_body(&key);
+        self.tabs.push(WorkspaceTab {
+            id: Uuid::new_v4().to_string(),
+            title: key.name.clone(),
+            kind: WorkspaceTabKind::TextPreview { title, body },
+        });
+        self.active_tab = self.tabs.len().saturating_sub(1);
+        cx.notify();
+    }
+
+    fn copy_identity_public_key(&mut self, key_id: &str, cx: &mut Context<Self>) {
+        let key = self
+            .system_index
+            .keys
+            .iter()
+            .chain(self.app_keys.iter())
+            .find(|key| key.id == key_id)
+            .cloned();
+        let Some(key) = key else {
+            return;
+        };
+
+        let body = identity_public_key_preview_body(&key);
+        if body.starts_with("Could not read public key.")
+            || body == "No public key file is associated with this identity."
+        {
+            self.add_log(format!("Public key copy failed for {}.", key.name));
+            cx.notify();
+            return;
+        }
+
+        cx.write_to_clipboard(ClipboardItem::new_string(body));
+        self.add_log(format!("Copied public key for {}.", key.name));
         cx.notify();
     }
 
@@ -640,8 +809,9 @@ impl PuppyTermView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let cursor_offset = self.editor_cursor_offset_for_mouse(position.x, window);
         if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+            let value = profile_field_value(editor, field).to_string();
+            let cursor_offset = Self::editor_cursor_offset_for_mouse(position.x, &value, window);
             editor.focused_field = field;
             editor.select_all = false;
             editor.cursor_offset =
@@ -658,14 +828,95 @@ impl PuppyTermView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let cursor_offset = self.editor_cursor_offset_for_mouse(position.x, window);
         if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+            let value = identity_field_value(editor, field).to_string();
+            let cursor_offset = Self::editor_cursor_offset_for_mouse(position.x, &value, window);
             editor.focused_field = field;
             editor.select_all = false;
             editor.cursor_offset =
                 cursor_offset.min(identity_field_value(editor, field).chars().count());
             cx.notify();
         }
+    }
+
+    fn choose_profile_identity(
+        &mut self,
+        editor_id: &str,
+        identity_path: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+            editor.auth_mode = ProfileAuthMode::Identity;
+            editor.identity_path = identity_path.unwrap_or_default();
+            editor.focused_field = ProfileFormField::IdentityPath;
+            editor.select_all = false;
+            editor.cursor_offset = editor.identity_path.chars().count();
+            editor.error = None;
+            cx.notify();
+        }
+    }
+
+    fn select_profile_auth_mode(
+        &mut self,
+        editor_id: &str,
+        auth_mode: ProfileAuthMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+            editor.auth_mode = auth_mode;
+            editor.focused_field = match auth_mode {
+                ProfileAuthMode::Identity => ProfileFormField::IdentityPath,
+                ProfileAuthMode::Password => ProfileFormField::Password,
+            };
+            editor.password_revealed = false;
+            editor.select_all = false;
+            editor.cursor_offset = profile_field_value(editor, editor.focused_field)
+                .chars()
+                .count();
+            editor.error = None;
+            cx.notify();
+        }
+    }
+
+    fn toggle_profile_password_reveal(&mut self, editor_id: &str, cx: &mut Context<Self>) {
+        let Some(editor) = self.profile_editors.get_mut(editor_id) else {
+            return;
+        };
+
+        if editor.password_revealed {
+            editor.password_revealed = false;
+            editor.error = None;
+            cx.notify();
+            return;
+        }
+
+        if editor.password.is_empty() {
+            if let Some(secret_id) = editor.password_secret_id.clone() {
+                match self.services.secret_store.get_secret(&secret_id) {
+                    Ok(Some(password)) => {
+                        editor.password = password;
+                    }
+                    Ok(None) => {
+                        editor.error =
+                            Some("No saved password was found in the system keychain.".into());
+                        cx.notify();
+                        return;
+                    }
+                    Err(error) => {
+                        editor.error = Some(format!("Could not load saved password: {error}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+
+        editor.password_revealed = true;
+        editor.focused_field = ProfileFormField::Password;
+        editor.cursor_offset = editor.password.chars().count();
+        editor.select_all = false;
+        editor.error = None;
+        cx.notify();
     }
 
     fn apply_profile_editor_keystroke(
@@ -690,14 +941,23 @@ impl PuppyTermView {
 
         match key.as_str() {
             "tab" => {
-                let fields = [
+                let identity_fields = [
                     ProfileFormField::DisplayName,
                     ProfileFormField::Hostname,
                     ProfileFormField::Username,
                     ProfileFormField::Port,
-                    ProfileFormField::IdentityPath,
-                    ProfileFormField::RemoteDirectory,
                 ];
+                let password_fields = [
+                    ProfileFormField::DisplayName,
+                    ProfileFormField::Hostname,
+                    ProfileFormField::Username,
+                    ProfileFormField::Port,
+                    ProfileFormField::Password,
+                ];
+                let fields: &[ProfileFormField] = match editor.auth_mode {
+                    ProfileAuthMode::Identity => &identity_fields,
+                    ProfileAuthMode::Password => &password_fields,
+                };
                 let current_index = fields
                     .iter()
                     .position(|field| *field == editor.focused_field)
@@ -831,14 +1091,63 @@ impl PuppyTermView {
         profile.port = port;
         profile.username =
             (!editor.username.trim().is_empty()).then_some(editor.username.trim().to_string());
-        profile.remote_directory = (!editor.remote_directory.trim().is_empty())
-            .then_some(editor.remote_directory.trim().to_string());
-        profile.identity_path = (!editor.identity_path.trim().is_empty())
-            .then_some(std::path::PathBuf::from(editor.identity_path.trim()));
+        profile.auth_method = AuthMethod::AgentOnly;
+
+        match editor.auth_mode {
+            ProfileAuthMode::Identity => {
+                if editor.identity_path.trim().is_empty() {
+                    editor.error = Some("Choose an identity for identity-based auth.".into());
+                    cx.notify();
+                    return;
+                }
+                profile.identity_path = (!editor.identity_path.trim().is_empty())
+                    .then_some(std::path::PathBuf::from(editor.identity_path.trim()));
+                if let Some(secret_id) = editor.password_secret_id.clone() {
+                    if let Err(error) = self.services.secret_store.delete_secret(&secret_id) {
+                        editor.error = Some(format!("Could not clear saved password: {error}"));
+                        cx.notify();
+                        return;
+                    }
+                    editor.password_secret_id = None;
+                }
+            }
+            ProfileAuthMode::Password => {
+                let password = editor.password.trim().to_string();
+                profile.identity_path = None;
+                if password.is_empty() {
+                    let Some(secret_id) = editor.password_secret_id.clone() else {
+                        editor.error =
+                            Some("Password is required when password auth is selected.".into());
+                        cx.notify();
+                        return;
+                    };
+                    profile.auth_method = AuthMethod::Password { secret_id };
+                } else {
+                    let secret_id = editor
+                        .password_secret_id
+                        .clone()
+                        .unwrap_or_else(|| format!("profile-password-{}", profile.id));
+                    if let Err(error) =
+                        self.services.secret_store.put_secret(&secret_id, &password)
+                    {
+                        editor.error = Some(format!("Could not save password: {error}"));
+                        cx.notify();
+                        return;
+                    }
+                    editor.password_secret_id = Some(secret_id.clone());
+                    profile.auth_method = AuthMethod::Password { secret_id };
+                }
+            }
+        }
 
         match self.services.repository.upsert_profile(&profile) {
             Ok(()) => {
-                self.app_profiles.insert(0, profile.clone());
+                if let Some(existing) = self.app_profiles.iter_mut().find(|item| item.id == profile.id)
+                {
+                    *existing = profile.clone();
+                } else {
+                    self.app_profiles.insert(0, profile.clone());
+                }
                 self.selected_profile_id = Some(profile.id.clone());
                 editor.error = None;
                 self.add_log(format!("Saved SSH profile {}.", profile.display_name));
@@ -1190,6 +1499,7 @@ impl PuppyTermView {
         let editor = TunnelEditorState {
             tunnel_id: editor_id,
             existing_tunnel_id: Some(tunnel.id.clone()),
+            step: TunnelEditorStep::Configure,
             name: tunnel.name.clone(),
             profile_id: tunnel.profile_id.clone(),
             mode: tunnel.mode,
@@ -1299,8 +1609,9 @@ impl PuppyTermView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let cursor_offset = self.editor_cursor_offset_for_mouse(position.x, window);
         if let Some(editor) = self.tunnel_editors.get_mut(editor_id) {
+            let value = tunnel_field_value(editor, field).to_string();
+            let cursor_offset = Self::editor_cursor_offset_for_mouse(position.x, &value, window);
             editor.focused_field = field;
             editor.select_all = false;
             editor.cursor_offset =
@@ -1309,17 +1620,55 @@ impl PuppyTermView {
         }
     }
 
-    fn editor_cursor_offset_for_mouse(&self, mouse_x: Pixels, window: &Window) -> usize {
-        let field_left = self.sidebar_width + px(24.0) + px(12.0);
-        let relative_x = (mouse_x - field_left).max(px(0.0));
-        let char_width = px(f32::from(window.line_height()) * 0.55);
-        ((f32::from(relative_x) / f32::from(char_width)).round() as usize).max(0)
+    fn editor_cursor_offset_for_mouse(mouse_x: Pixels, value: &str, window: &Window) -> usize {
+        // Mouse events for these custom inputs are delivered relative to the input box,
+        // so only subtract the field's own horizontal padding before mapping to a glyph.
+        let input_padding_x = px(12.0);
+        let relative_x = (mouse_x - input_padding_x).max(px(0.0));
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let sample = "0".repeat(value.chars().count().max(1) + 1);
+        let run = TextRun {
+            len: sample.len(),
+            font: font(".SystemUIFontMonospaced"),
+            color: window.text_style().color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(SharedString::from(sample), font_size, &[run], None)
+            .closest_index_for_x(relative_x)
     }
 
     fn select_tunnel_profile(&mut self, editor_id: &str, profile_id: &str, cx: &mut Context<Self>) {
+        let selected_profile_name = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .map(|profile| profile.display_name.clone());
         if let Some(editor) = self.tunnel_editors.get_mut(editor_id) {
             editor.profile_id = profile_id.to_string();
+            if editor.existing_tunnel_id.is_none() {
+                if let Some(profile_name) = selected_profile_name {
+                    editor.name = format!("{} Tunnel", profile_name);
+                    editor.cursor_offset = editor.name.chars().count();
+                }
+                editor.step = TunnelEditorStep::Configure;
+                editor.focused_field = TunnelFormField::BindHost;
+                editor.select_all = false;
+            }
             cx.notify();
+        }
+    }
+
+    fn go_to_tunnel_profile_step(&mut self, editor_id: &str, cx: &mut Context<Self>) {
+        if let Some(editor) = self.tunnel_editors.get_mut(editor_id) {
+            if editor.existing_tunnel_id.is_none() {
+                editor.step = TunnelEditorStep::SelectProfile;
+                editor.error = None;
+                cx.notify();
+            }
         }
     }
 
@@ -1383,6 +1732,16 @@ impl PuppyTermView {
         };
 
         let key = event.keystroke.key.to_lowercase();
+        if editor.step == TunnelEditorStep::SelectProfile {
+            if key == "escape" {
+                editor.error = None;
+                self.tunnel_context_menu = None;
+                cx.notify();
+                return true;
+            }
+            return false;
+        }
+
         if (event.keystroke.modifiers.platform || event.keystroke.modifiers.control) && key == "a" {
             editor.select_all = true;
             editor.cursor_offset = tunnel_field_value(editor, editor.focused_field)
@@ -1587,8 +1946,20 @@ impl PuppyTermView {
         cx: &mut Context<Self>,
     ) {
         self.selected_profile_id = Some(profile.id.clone());
+        let saved_password = match &profile.auth_method {
+            AuthMethod::Password { secret_id } => self
+                .services
+                .secret_store
+                .get_secret(secret_id)
+                .ok()
+                .flatten(),
+            _ => None,
+        };
         match self.services.ssh_backend.open_terminal_session(&profile) {
             Ok(handle) => {
+                if let Some(password) = saved_password {
+                    self.spawn_saved_password_autofill(handle.clone(), password);
+                }
                 let snapshot = handle.snapshot();
                 let session_id = snapshot.id.clone();
                 self.tabs.push(WorkspaceTab {
@@ -1606,6 +1977,24 @@ impl PuppyTermView {
             Err(error) => self.add_log(format!("Session launch failed: {error}")),
         }
         cx.notify();
+    }
+
+    fn spawn_saved_password_autofill(&self, handle: TerminalSessionHandle, password: String) {
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                let snapshot = handle.snapshot();
+                if snapshot.exit_status.is_some() {
+                    break;
+                }
+                if session_requests_password(&snapshot.rendered_screen)
+                    || session_requests_password(&snapshot.raw_output)
+                {
+                    let _ = handle.send_input(&(password.clone() + "\n"));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
     }
 
     fn preview_sftp(&mut self, cx: &mut Context<Self>) {
@@ -1962,49 +2351,7 @@ impl PuppyTermView {
         };
 
         let section_body = match self.selected_menu_section {
-            MenuSection::Hosts => div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_3xl()
-                                .font_weight(FontWeight::BOLD)
-                                .child(section_title),
-                        )
-                        .child(
-                            div()
-                                .id("new-ssh-profile")
-                                .px_3()
-                                .py_2()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .bg(rgb(0x0f172a))
-                                .hover(|this| this.bg(rgb(0x1e293b)))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_profile_editor(cx);
-                                }))
-                                .child(div().text_sm().font_weight(FontWeight::BOLD).child("+")),
-                        ),
-                )
-                .child(
-                    div().flex().flex_col().gap_2().children(
-                        self.system_index
-                            .profiles
-                            .iter()
-                            .chain(self.app_profiles.iter())
-                            .map(|profile| {
-                                render_connect_profile_row(profile, cx).into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                )
-                .into_any_element(),
+            MenuSection::Hosts => self.render_ssh_profiles_page(cx).into_any_element(),
             MenuSection::Identities => div()
                 .flex()
                 .flex_col()
@@ -2041,7 +2388,20 @@ impl PuppyTermView {
                             .keys
                             .iter()
                             .chain(self.app_keys.iter())
-                            .map(|key| render_identity_row(key).into_any_element())
+                            .map(|key| {
+                                let key_id = key.id.clone();
+                                div()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(rgb(0x334155)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_identity_public_key_preview(&key_id, cx);
+                                        }),
+                                    )
+                                    .child(render_identity_row(key, cx))
+                                    .into_any_element()
+                            })
                             .collect::<Vec<_>>(),
                     ),
                 )
@@ -2227,8 +2587,7 @@ impl PuppyTermView {
                 .child(div().mt_2().flex().flex_wrap().gap_2().children(
                     self.all_profiles().into_iter().map(|profile| {
                         let profile_id = profile.id.clone();
-                        let active =
-                            self.selected_sftp_profile_id.as_deref() == Some(profile.id.as_str());
+                        let active = self.active_sftp_profile_id() == Some(profile.id.as_str());
                         div()
                             .id(SharedString::from(format!("sftp-profile-{}", profile.id)))
                             .px_3()
@@ -2240,7 +2599,7 @@ impl PuppyTermView {
                             .border_color(if active { rgb(0x60a5fa) } else { rgb(0x334155) })
                             .hover(|this| this.bg(rgb(0x334155)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_sftp_profile(&profile_id, cx);
+                                this.open_sftp_browser(&profile_id, cx);
                             }))
                             .child(
                                 div()
@@ -2251,173 +2610,17 @@ impl PuppyTermView {
                             .into_any_element()
                     }),
                 ))
-                .when(self.selected_sftp_profile_id.is_some(), |this| {
-                    this.child(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("sftp-up")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(rgb(0x0f172a))
-                                    .border_1()
-                                    .border_color(rgb(0x1e293b))
-                                    .hover(|this| this.bg(rgb(0x1e293b)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.go_up_sftp_directory(cx);
-                                    }))
-                                    .child(
-                                        div().text_sm().font_weight(FontWeight::BOLD).child("Up"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(0x0f172a))
-                                    .border_1()
-                                    .border_color(rgb(0x1e293b))
-                                    .text_color(rgb(0xcbd5e1))
-                                    .child(format!("Path: {}", self.sftp_browser_path)),
-                            )
-                            .child(
-                                div()
-                                    .id("sftp-refresh")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(rgb(0x0f172a))
-                                    .border_1()
-                                    .border_color(rgb(0x1e293b))
-                                    .hover(|this| this.bg(rgb(0x1e293b)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.refresh_sftp_browser(cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::BOLD)
-                                            .child("Refresh"),
-                                    ),
-                            ),
-                    )
-                })
-                .when_some(self.sftp_browser_error.as_ref(), |this, error| {
-                    this.child(
-                        div()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(0x7f1d1d))
-                            .bg(rgb(0x1f1014))
-                            .p_3()
-                            .text_color(rgb(0xfca5a5))
-                            .child(error.clone()),
-                    )
-                })
-                .when(self.selected_sftp_profile_id.is_none(), |this| {
-                    this.child(
-                        div()
-                            .mt_2()
-                            .p_3()
-                            .rounded_md()
-                            .bg(rgb(0x0f172a))
-                            .border_1()
-                            .border_color(rgb(0x1e293b))
-                            .text_color(rgb(0x94a3b8))
-                            .child("Select an SSH profile to open its SFTP browser."),
-                    )
-                })
-                .when(self.selected_sftp_profile_id.is_some(), |this| {
-                    this.child(div().mt_2().flex().flex_col().gap_2().children(
-                        if self.sftp_browser_entries.is_empty() {
-                            vec![
-                                div()
-                                    .p_3()
-                                    .rounded_md()
-                                    .bg(rgb(0x0f172a))
-                                    .border_1()
-                                    .border_color(rgb(0x1e293b))
-                                    .text_color(rgb(0x94a3b8))
-                                    .child("No directory entries.")
-                                    .into_any_element(),
-                            ]
-                        } else {
-                            self.sftp_browser_entries
-                                .iter()
-                                .map(|entry| {
-                                    let entry_name = entry.name.clone();
-                                    let row = div()
-                                        .id(SharedString::from(format!(
-                                            "sftp-entry-{}",
-                                            entry.name
-                                        )))
-                                        .p_3()
-                                        .rounded_md()
-                                        .bg(rgb(0x0f172a))
-                                        .border_1()
-                                        .border_color(rgb(0x1e293b))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .justify_between()
-                                                .items_center()
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .child(format!(
-                                                            "{}{}",
-                                                            if entry.is_dir {
-                                                                "[DIR] "
-                                                            } else {
-                                                                ""
-                                                            },
-                                                            entry.name
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(0x94a3b8))
-                                                        .child(if entry.is_dir {
-                                                            "Directory"
-                                                        } else {
-                                                            "File"
-                                                        }),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .mt_1()
-                                                .text_xs()
-                                                .text_color(rgb(0xcbd5e1))
-                                                .child(entry.detail.clone()),
-                                        );
-
-                                    if entry.is_dir {
-                                        row.cursor_pointer()
-                                            .hover(|this| this.bg(rgb(0x1e293b)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_sftp_entry(&entry_name, cx);
-                                            }))
-                                            .into_any_element()
-                                    } else {
-                                        row.into_any_element()
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    ))
-                })
+                .child(
+                    div()
+                        .mt_2()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(0x0f172a))
+                        .border_1()
+                        .border_color(rgb(0x1e293b))
+                        .text_color(rgb(0x94a3b8))
+                        .child("Select an SSH profile to open it in a new SFTP tab."),
+                )
                 .into_any_element(),
         };
 
@@ -2672,6 +2875,41 @@ impl PuppyTermView {
             .cloned()
             .expect("profile editor must exist");
         let focused = self.profile_editor_focus.is_focused(window);
+        let use_identity = editor.auth_mode == ProfileAuthMode::Identity;
+        let use_password = editor.auth_mode == ProfileAuthMode::Password;
+        let identity_buttons = self
+            .system_index
+            .keys
+            .iter()
+            .chain(self.app_keys.iter())
+            .filter_map(|key| {
+                let path = key.path.as_ref()?.display().to_string();
+                let active = editor.identity_path == path;
+                let editor_id = editor_id.to_string();
+                let label = key.name.clone();
+                Some(
+                    div()
+                        .id(SharedString::from(format!(
+                            "profile-identity-{}-{}",
+                            editor_id, key.id
+                        )))
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(if active { rgb(0x14532d) } else { rgb(0x1e293b) })
+                        .border_1()
+                        .border_color(if active { rgb(0x22c55e) } else { rgb(0x334155) })
+                        .hover(|this| this.bg(rgb(0x334155)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_profile_identity(&editor_id, Some(path.clone()), cx);
+                        }))
+                        .child(label)
+                        .into_any_element(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let has_identity_buttons = !identity_buttons.is_empty();
 
         div()
             .id(SharedString::from(format!("profile-editor-{editor_id}")))
@@ -2731,6 +2969,8 @@ impl PuppyTermView {
                         editor.cursor_offset,
                         editor_id,
                         ProfileFormField::DisplayName,
+                        false,
+                        None,
                         cx,
                     ))
                     .child(render_profile_input(
@@ -2741,6 +2981,8 @@ impl PuppyTermView {
                         editor.cursor_offset,
                         editor_id,
                         ProfileFormField::Hostname,
+                        false,
+                        None,
                         cx,
                     ))
                     .child(render_profile_input(
@@ -2751,6 +2993,8 @@ impl PuppyTermView {
                         editor.cursor_offset,
                         editor_id,
                         ProfileFormField::Username,
+                        false,
+                        None,
                         cx,
                     ))
                     .child(render_profile_input(
@@ -2761,29 +3005,194 @@ impl PuppyTermView {
                         editor.cursor_offset,
                         editor_id,
                         ProfileFormField::Port,
+                        false,
+                        None,
                         cx,
                     ))
-                    .child(render_profile_input(
-                        "Identity Path",
-                        &editor.identity_path,
-                        editor.focused_field == ProfileFormField::IdentityPath,
-                        editor.select_all && editor.focused_field == ProfileFormField::IdentityPath,
-                        editor.cursor_offset,
-                        editor_id,
-                        ProfileFormField::IdentityPath,
-                        cx,
-                    ))
-                    .child(render_profile_input(
-                        "Remote Directory",
-                        &editor.remote_directory,
-                        editor.focused_field == ProfileFormField::RemoteDirectory,
-                        editor.select_all
-                            && editor.focused_field == ProfileFormField::RemoteDirectory,
-                        editor.cursor_offset,
-                        editor_id,
-                        ProfileFormField::RemoteDirectory,
-                        cx,
-                    ))
+                    .child(
+                        div()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x94a3b8))
+                                    .child("Authentication"),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(if use_identity { rgb(0x1d4ed8) } else { rgb(0x1e293b) })
+                                            .border_1()
+                                            .border_color(if use_identity { rgb(0x60a5fa) } else { rgb(0x334155) })
+                                            .hover(|this| this.bg(rgb(0x334155)))
+                                            .on_mouse_down(MouseButton::Left, cx.listener({
+                                                let editor_id = editor_id.to_string();
+                                                move |this, _, _, cx| {
+                                                    this.select_profile_auth_mode(
+                                                        &editor_id,
+                                                        ProfileAuthMode::Identity,
+                                                        cx,
+                                                    );
+                                                }
+                                            }))
+                                            .child("Use Identity"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(if use_password { rgb(0x1d4ed8) } else { rgb(0x1e293b) })
+                                            .border_1()
+                                            .border_color(if use_password { rgb(0x60a5fa) } else { rgb(0x334155) })
+                                            .hover(|this| this.bg(rgb(0x334155)))
+                                            .on_mouse_down(MouseButton::Left, cx.listener({
+                                                let editor_id = editor_id.to_string();
+                                                move |this, _, _, cx| {
+                                                    this.select_profile_auth_mode(
+                                                        &editor_id,
+                                                        ProfileAuthMode::Password,
+                                                        cx,
+                                                    );
+                                                }
+                                            }))
+                                            .child("Use Password"),
+                                    ),
+                            ),
+                    )
+                    .when(use_identity && has_identity_buttons, |this| {
+                        this.child(
+                            div()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0x94a3b8))
+                                        .child("Choose Identity"),
+                                )
+                                .child(
+                                    div()
+                                        .mt_2()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .children(identity_buttons),
+                                )
+                                .child(
+                                    div().mt_2().child(
+                                        div()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(rgb(0x0f172a))
+                                            .border_1()
+                                            .border_color(rgb(0x334155))
+                                            .hover(|this| this.bg(rgb(0x1e293b)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener({
+                                                    let editor_id = editor_id.to_string();
+                                                    move |this, _, _, cx| {
+                                                        this.choose_profile_identity(
+                                                            &editor_id, None, cx,
+                                                        );
+                                                    }
+                                                }),
+                                            )
+                                            .child("Clear Identity"),
+                                    ),
+                                ),
+                        )
+                    })
+                    .when(use_identity && !has_identity_buttons, |this| {
+                        this.child(
+                            div()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x334155))
+                                .bg(rgb(0x0f172a))
+                                .p_3()
+                                .text_color(rgb(0x94a3b8))
+                                .child("No identities available. Create one in the Identities page first."),
+                        )
+                    })
+                    .when(use_password, |this| {
+                        this.child(
+                            div()
+                                .child(render_profile_input(
+                                    "Password",
+                                    &editor.password,
+                                    editor.focused_field == ProfileFormField::Password,
+                                    editor.select_all
+                                        && editor.focused_field == ProfileFormField::Password,
+                                    editor.cursor_offset,
+                                    editor_id,
+                                    ProfileFormField::Password,
+                                    !editor.password_revealed,
+                                    if editor.password_secret_id.is_some() && editor.password.is_empty()
+                                    {
+                                        Some("••••••••")
+                                    } else {
+                                        None
+                                    },
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .mt_2()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(rgb(0x0f172a))
+                                                .border_1()
+                                                .border_color(rgb(0x334155))
+                                                .hover(|this| this.bg(rgb(0x1e293b)))
+                                                .on_mouse_down(MouseButton::Left, cx.listener({
+                                                    let editor_id = editor_id.to_string();
+                                                    move |this, _, _, cx| {
+                                                        this.toggle_profile_password_reveal(
+                                                            &editor_id, cx,
+                                                        );
+                                                    }
+                                                }))
+                                                .child(if editor.password_revealed {
+                                                    "Hide Password"
+                                                } else if editor.password_secret_id.is_some()
+                                                    && editor.password.is_empty()
+                                                {
+                                                    "Reveal Saved Password"
+                                                } else {
+                                                    "Reveal Password"
+                                                }),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(use_password, |this| {
+                        this.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x94a3b8))
+                                .child(if editor.password_secret_id.is_some() {
+                                    "A saved password exists in the system keychain. Type a new one to replace it."
+                                } else {
+                                    "Saved in the system keychain for this profile."
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .mt_2()
@@ -3131,6 +3540,13 @@ impl PuppyTermView {
             })
             .collect::<Vec<_>>();
 
+        let selected_profile_name = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == editor.profile_id)
+            .map(|profile| profile.display_name.clone())
+            .unwrap_or_else(|| "Unknown profile".into());
+
         div()
             .id(SharedString::from(format!("tunnel-editor-{editor_id}")))
             .track_focus(&self.tunnel_editor_focus)
@@ -3186,77 +3602,139 @@ impl PuppyTermView {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .child(render_tunnel_input(
-                        "Name",
-                        &editor.name,
-                        editor.focused_field == TunnelFormField::Name,
-                        editor.select_all && editor.focused_field == TunnelFormField::Name,
-                        editor.cursor_offset,
-                        editor_id,
-                        TunnelFormField::Name,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .child(div().text_sm().text_color(rgb(0x94a3b8)).child("Profile"))
+                    .when(
+                        editor.existing_tunnel_id.is_none()
+                            && editor.step == TunnelEditorStep::SelectProfile,
+                        |this| {
+                            this.child(
+                                div()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0x94a3b8))
+                                            .child("Step 1: Choose SSH Profile"),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .children(profile_buttons),
+                                    ),
+                            )
+                        },
+                    )
+                    .when(
+                        editor.existing_tunnel_id.is_some()
+                            || editor.step == TunnelEditorStep::Configure,
+                        |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0x94a3b8))
+                                            .child(format!("Profile: {selected_profile_name}")),
+                                    )
+                                    .when(editor.existing_tunnel_id.is_none(), |this| {
+                                        this.child(
+                                            div()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(rgb(0x0f172a))
+                                                .border_1()
+                                                .border_color(rgb(0x334155))
+                                                .hover(|this| this.bg(rgb(0x1e293b)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener({
+                                                        let editor_id = editor_id.to_string();
+                                                        move |this, _, _, cx| {
+                                                            this.go_to_tunnel_profile_step(
+                                                                &editor_id, cx,
+                                                            );
+                                                        }
+                                                    }),
+                                                )
+                                                .child("Back"),
+                                        )
+                                    }),
+                            )
+                            .child(render_tunnel_input(
+                                "Name",
+                                &editor.name,
+                                editor.focused_field == TunnelFormField::Name,
+                                editor.select_all && editor.focused_field == TunnelFormField::Name,
+                                editor.cursor_offset,
+                                editor_id,
+                                TunnelFormField::Name,
+                                cx,
+                            ))
                             .child(
                                 div()
-                                    .mt_2()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .children(profile_buttons),
-                            ),
+                                    .child(div().text_sm().text_color(rgb(0x94a3b8)).child("Mode"))
+                                    .child(div().mt_2().flex().gap_2().children(mode_buttons)),
+                            )
+                            .child(render_tunnel_input(
+                                "Bind Host",
+                                &editor.bind_host,
+                                editor.focused_field == TunnelFormField::BindHost,
+                                editor.select_all
+                                    && editor.focused_field == TunnelFormField::BindHost,
+                                editor.cursor_offset,
+                                editor_id,
+                                TunnelFormField::BindHost,
+                                cx,
+                            ))
+                            .child(render_tunnel_input(
+                                "Bind Port",
+                                &editor.bind_port,
+                                editor.focused_field == TunnelFormField::BindPort,
+                                editor.select_all
+                                    && editor.focused_field == TunnelFormField::BindPort,
+                                editor.cursor_offset,
+                                editor_id,
+                                TunnelFormField::BindPort,
+                                cx,
+                            ))
+                            .when(
+                                !matches!(editor.mode, TunnelMode::DynamicSocks),
+                                |this| {
+                                    this.child(render_tunnel_input(
+                                        "Target Host",
+                                        &editor.target_host,
+                                        editor.focused_field == TunnelFormField::TargetHost,
+                                        editor.select_all
+                                            && editor.focused_field == TunnelFormField::TargetHost,
+                                        editor.cursor_offset,
+                                        editor_id,
+                                        TunnelFormField::TargetHost,
+                                        cx,
+                                    ))
+                                    .child(
+                                        render_tunnel_input(
+                                            "Target Port",
+                                            &editor.target_port,
+                                            editor.focused_field == TunnelFormField::TargetPort,
+                                            editor.select_all
+                                                && editor.focused_field
+                                                    == TunnelFormField::TargetPort,
+                                            editor.cursor_offset,
+                                            editor_id,
+                                            TunnelFormField::TargetPort,
+                                            cx,
+                                        ),
+                                    )
+                                },
+                            )
+                        },
                     )
-                    .child(
-                        div()
-                            .child(div().text_sm().text_color(rgb(0x94a3b8)).child("Mode"))
-                            .child(div().mt_2().flex().gap_2().children(mode_buttons)),
-                    )
-                    .child(render_tunnel_input(
-                        "Bind Host",
-                        &editor.bind_host,
-                        editor.focused_field == TunnelFormField::BindHost,
-                        editor.select_all && editor.focused_field == TunnelFormField::BindHost,
-                        editor.cursor_offset,
-                        editor_id,
-                        TunnelFormField::BindHost,
-                        cx,
-                    ))
-                    .child(render_tunnel_input(
-                        "Bind Port",
-                        &editor.bind_port,
-                        editor.focused_field == TunnelFormField::BindPort,
-                        editor.select_all && editor.focused_field == TunnelFormField::BindPort,
-                        editor.cursor_offset,
-                        editor_id,
-                        TunnelFormField::BindPort,
-                        cx,
-                    ))
-                    .when(!matches!(editor.mode, TunnelMode::DynamicSocks), |this| {
-                        this.child(render_tunnel_input(
-                            "Target Host",
-                            &editor.target_host,
-                            editor.focused_field == TunnelFormField::TargetHost,
-                            editor.select_all
-                                && editor.focused_field == TunnelFormField::TargetHost,
-                            editor.cursor_offset,
-                            editor_id,
-                            TunnelFormField::TargetHost,
-                            cx,
-                        ))
-                        .child(render_tunnel_input(
-                            "Target Port",
-                            &editor.target_port,
-                            editor.focused_field == TunnelFormField::TargetPort,
-                            editor.select_all
-                                && editor.focused_field == TunnelFormField::TargetPort,
-                            editor.cursor_offset,
-                            editor_id,
-                            TunnelFormField::TargetPort,
-                            cx,
-                        ))
-                    })
                     .child(
                         div()
                             .mt_2()
@@ -3271,9 +3749,24 @@ impl PuppyTermView {
                                     .cursor_pointer()
                                     .bg(rgb(0x1d4ed8))
                                     .hover(|this| this.bg(rgb(0x2563eb)))
+                                    .when(
+                                        editor.existing_tunnel_id.is_none()
+                                            && editor.step == TunnelEditorStep::SelectProfile,
+                                        |this| this.opacity(0.5),
+                                    )
                                     .on_click(cx.listener({
                                         let editor_id = editor_id.to_string();
                                         move |this, _, _, cx| {
+                                            if let Some(editor) =
+                                                this.tunnel_editors.get(&editor_id)
+                                            {
+                                                if editor.existing_tunnel_id.is_none()
+                                                    && editor.step
+                                                        == TunnelEditorStep::SelectProfile
+                                                {
+                                                    return;
+                                                }
+                                            }
                                             this.save_tunnel_editor(&editor_id, cx);
                                         }
                                     }))
@@ -3324,7 +3817,12 @@ impl PuppyTermView {
             })
     }
 
-    fn render_text_preview(&self, title: String, body: String) -> impl IntoElement {
+    fn render_text_preview(
+        &self,
+        title: String,
+        body: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .id("preview-pane")
             .size_full()
@@ -3332,7 +3830,34 @@ impl PuppyTermView {
             .overflow_scroll()
             .bg(rgb(0x020617))
             .text_color(rgb(0xe2e8f0))
-            .child(div().text_xl().font_weight(FontWeight::BOLD).child(title))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(title))
+                    .child({
+                        let copy_body = body.clone();
+                        div()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgb(0x0f172a))
+                            .border_1()
+                            .border_color(rgb(0x334155))
+                            .hover(|this| this.bg(rgb(0x1e293b)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_body.clone(),
+                                    ));
+                                }),
+                            )
+                            .child(div().text_sm().font_weight(FontWeight::BOLD).child("Copy"))
+                    }),
+            )
             .child(
                 div()
                     .mt_4()
@@ -3342,17 +3867,123 @@ impl PuppyTermView {
             )
     }
 
-    fn render_profile_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let connectable_profiles = self
-            .system_index
-            .profiles
-            .iter()
-            .chain(self.app_profiles.iter())
-            .map(|profile| render_connect_profile_row(profile, cx).into_any_element())
-            .collect::<Vec<_>>();
+    fn render_ssh_profile_row(
+        &self,
+        profile: &HostProfile,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let profile_clone = profile.clone();
+        let is_app_profile = profile.source == ProfileSource::AppManaged;
+        let profile_id = profile.id.clone();
 
         div()
-            .id("profile-picker-pane")
+            .id(SharedString::from(format!("connect-profile-{}", profile.id)))
+            .p_3()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(rgb(0x1e293b))
+            .hover(|this| this.bg(rgb(0x334155)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.profile_context_menu = None;
+                this.start_session_for_profile(profile_clone.clone(), window, cx);
+            }))
+            .when(is_app_profile, |this| {
+                this.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener({
+                        let profile_id = profile_id.clone();
+                        move |this, _, _, cx| {
+                            this.open_profile_context_menu(&profile_id, cx);
+                        }
+                    }),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .child(profile.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .bg(match profile.source {
+                                ProfileSource::SystemDiscovered => rgb(0x14532d),
+                                ProfileSource::AppManaged => rgb(0x7c2d12),
+                            })
+                            .text_xs()
+                            .child(match profile.source {
+                                ProfileSource::SystemDiscovered => "System",
+                                ProfileSource::AppManaged => "App",
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0xcbd5e1))
+                    .child(format!(
+                        "{}{}",
+                        profile.hostname,
+                        profile
+                            .username
+                            .as_ref()
+                            .map(|user| format!(" as {user}"))
+                            .unwrap_or_default()
+                    )),
+            )
+            .when(
+                is_app_profile
+                    && self
+                        .profile_context_menu
+                        .as_ref()
+                        .is_some_and(|menu| menu.profile_id == profile.id),
+                |this| {
+                    this.child(
+                        div()
+                            .mt_3()
+                            .w(px(160.0))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x334155))
+                            .bg(rgb(0x0f172a))
+                            .p_2()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "profile-menu-edit-{}",
+                                        profile.id
+                                    )))
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(rgb(0x1e293b)))
+                                    .on_mouse_down(MouseButton::Left, cx.listener({
+                                        let profile_id = profile.id.clone();
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.edit_profile_config(&profile_id, cx);
+                                        }
+                                    }))
+                                    .child("Edit"),
+                            ),
+                    )
+                },
+            )
+    }
+
+    fn render_ssh_profiles_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("ssh-profiles-pane")
             .size_full()
             .p_5()
             .overflow_scroll()
@@ -3360,24 +3991,218 @@ impl PuppyTermView {
             .text_color(rgb(0xe2e8f0))
             .child(
                 div()
-                    .text_3xl()
-                    .font_weight(FontWeight::BOLD)
-                    .child("Connect"),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .text_color(rgb(0x94a3b8))
-                    .child("Choose a saved profile to open a new connection."),
-            )
-            .child(
-                div()
-                    .mt_6()
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(connectable_profiles),
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_3xl().font_weight(FontWeight::BOLD).child("SSH"))
+                    .child(
+                        div()
+                            .id("new-ssh-profile")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgb(0x0f172a))
+                            .hover(|this| this.bg(rgb(0x1e293b)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_profile_editor(cx);
+                            }))
+                            .child(div().text_sm().font_weight(FontWeight::BOLD).child("+")),
+                    ),
             )
+            .child(
+                div().mt_6().flex().flex_col().gap_2().children(
+                    self.system_index
+                        .profiles
+                        .iter()
+                        .chain(self.app_profiles.iter())
+                        .map(|profile| self.render_ssh_profile_row(profile, cx).into_any_element())
+                        .collect::<Vec<_>>(),
+                ),
+            )
+    }
+
+    fn render_sftp_browser_tab(
+        &self,
+        profile_id: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let profile = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned();
+        let browser = self.sftp_browsers.get(profile_id).cloned();
+
+        div()
+            .id(SharedString::from(format!(
+                "sftp-browser-pane-{profile_id}"
+            )))
+            .size_full()
+            .p_5()
+            .overflow_scroll()
+            .bg(rgb(0x020617))
+            .text_color(rgb(0xe2e8f0))
+            .child(
+                div().text_3xl().font_weight(FontWeight::BOLD).child(
+                    profile
+                        .as_ref()
+                        .map(|profile| format!("SFTP {}", profile.display_name))
+                        .unwrap_or_else(|| "SFTP".into()),
+                ),
+            )
+            .when_some(browser.as_ref(), |this, browser| {
+                this.child(
+                    div()
+                        .mt_4()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("sftp-up-{profile_id}")))
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgb(0x0f172a))
+                                .border_1()
+                                .border_color(rgb(0x1e293b))
+                                .hover(|this| this.bg(rgb(0x1e293b)))
+                                .on_click(cx.listener({
+                                    let profile_id = profile_id.to_string();
+                                    move |this, _, _, cx| {
+                                        this.go_up_sftp_directory(&profile_id, cx);
+                                    }
+                                }))
+                                .child(div().text_sm().font_weight(FontWeight::BOLD).child("Up")),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(rgb(0x0f172a))
+                                .border_1()
+                                .border_color(rgb(0x1e293b))
+                                .text_color(rgb(0xcbd5e1))
+                                .child(format!("Path: {}", browser.path)),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("sftp-refresh-{profile_id}")))
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgb(0x0f172a))
+                                .border_1()
+                                .border_color(rgb(0x1e293b))
+                                .hover(|this| this.bg(rgb(0x1e293b)))
+                                .on_click(cx.listener({
+                                    let profile_id = profile_id.to_string();
+                                    move |this, _, _, cx| {
+                                        this.refresh_sftp_browser(&profile_id, cx);
+                                    }
+                                }))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("Refresh"),
+                                ),
+                        ),
+                )
+                .when_some(browser.error.as_ref(), |this, error| {
+                    this.child(
+                        div()
+                            .mt_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x7f1d1d))
+                            .bg(rgb(0x1f1014))
+                            .p_3()
+                            .text_color(rgb(0xfca5a5))
+                            .child(error.clone()),
+                    )
+                })
+                .child(div().mt_3().flex().flex_col().gap_2().children(
+                    if browser.entries.is_empty() {
+                        vec![
+                            div()
+                                .p_3()
+                                .rounded_md()
+                                .bg(rgb(0x0f172a))
+                                .border_1()
+                                .border_color(rgb(0x1e293b))
+                                .text_color(rgb(0x94a3b8))
+                                .child("No directory entries.")
+                                .into_any_element(),
+                        ]
+                    } else {
+                        browser
+                            .entries
+                            .iter()
+                            .map(|entry| {
+                                let entry_name = entry.name.clone();
+                                let row = div()
+                                    .id(SharedString::from(format!(
+                                        "sftp-entry-{}-{}",
+                                        profile_id, entry.name
+                                    )))
+                                    .p_3()
+                                    .rounded_md()
+                                    .bg(rgb(0x0f172a))
+                                    .border_1()
+                                    .border_color(rgb(0x1e293b))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .child(format!(
+                                                        "{}{}",
+                                                        if entry.is_dir { "[DIR] " } else { "" },
+                                                        entry.name
+                                                    )),
+                                            )
+                                            .child(
+                                                div().text_xs().text_color(rgb(0x94a3b8)).child(
+                                                    if entry.is_dir { "Directory" } else { "File" },
+                                                ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(rgb(0xcbd5e1))
+                                            .child(entry.detail.clone()),
+                                    );
+
+                                if entry.is_dir {
+                                    row.cursor_pointer()
+                                        .hover(|this| this.bg(rgb(0x1e293b)))
+                                        .on_click(cx.listener({
+                                            let profile_id = profile_id.to_string();
+                                            move |this, _, _, cx| {
+                                                this.open_sftp_entry(&profile_id, &entry_name, cx);
+                                            }
+                                        }))
+                                        .into_any_element()
+                                } else {
+                                    row.into_any_element()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                ))
+            })
     }
 
     fn render_active_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -3393,13 +4218,15 @@ impl PuppyTermView {
 
         match tab.kind {
             WorkspaceTabKind::Menu => self.render_menu_page(cx).into_any_element(),
-            WorkspaceTabKind::ProfilePicker => self.render_profile_picker(cx).into_any_element(),
             WorkspaceTabKind::Profile { profile_id } => self
                 .render_profile_details(
                     self.all_profiles()
                         .into_iter()
                         .find(|profile| profile.id == profile_id),
                 )
+                .into_any_element(),
+            WorkspaceTabKind::SftpBrowser { profile_id } => self
+                .render_sftp_browser_tab(&profile_id, cx)
                 .into_any_element(),
             WorkspaceTabKind::ProfileEditor { editor_id } => self
                 .render_profile_editor(&editor_id, window, cx)
@@ -3414,7 +4241,7 @@ impl PuppyTermView {
                 .render_tunnel_editor(&editor_id, window, cx)
                 .into_any_element(),
             WorkspaceTabKind::TextPreview { title, body } => {
-                self.render_text_preview(title, body).into_any_element()
+                self.render_text_preview(title, body, cx).into_any_element()
             }
         }
     }
@@ -3441,6 +4268,19 @@ fn metric_card(title: &str, value: usize) -> impl IntoElement {
                 .font_weight(FontWeight::BOLD)
                 .child(value.to_string()),
         )
+}
+
+fn session_requests_password(output: &str) -> bool {
+    output
+        .lines()
+        .rev()
+        .take(3)
+        .map(|line| line.trim().to_ascii_lowercase())
+        .any(|line| {
+            line.ends_with("password:")
+                || line.ends_with("password: ")
+                || line.contains("password for ")
+        })
 }
 
 fn menu_nav_button(
@@ -3525,70 +4365,7 @@ fn parent_remote_path(path: &str) -> String {
     }
 }
 
-fn render_connect_profile_row(
-    profile: &HostProfile,
-    cx: &mut Context<PuppyTermView>,
-) -> impl IntoElement {
-    let profile_clone = profile.clone();
-
-    div()
-        .id(SharedString::from(format!(
-            "connect-profile-{}",
-            profile.id
-        )))
-        .p_3()
-        .rounded_md()
-        .cursor_pointer()
-        .bg(rgb(0x1e293b))
-        .hover(|this| this.bg(rgb(0x334155)))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.start_session_for_profile(profile_clone.clone(), window, cx);
-        }))
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .items_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .child(profile.display_name.clone()),
-                )
-                .child(
-                    div()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_full()
-                        .bg(match profile.source {
-                            ProfileSource::SystemDiscovered => rgb(0x14532d),
-                            ProfileSource::AppManaged => rgb(0x7c2d12),
-                        })
-                        .text_xs()
-                        .child(match profile.source {
-                            ProfileSource::SystemDiscovered => "System",
-                            ProfileSource::AppManaged => "App",
-                        }),
-                ),
-        )
-        .child(
-            div()
-                .mt_1()
-                .text_xs()
-                .text_color(rgb(0xcbd5e1))
-                .child(format!(
-                    "{}{}",
-                    profile.hostname,
-                    profile
-                        .username
-                        .as_ref()
-                        .map(|user| format!(" as {user}"))
-                        .unwrap_or_default()
-                )),
-        )
-}
-
-fn render_identity_row(key: &StoredKey) -> impl IntoElement {
+fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl IntoElement {
     let source_label = match key.source {
         ProfileSource::SystemDiscovered => "System",
         ProfileSource::AppManaged => "App",
@@ -3622,15 +4399,44 @@ fn render_identity_row(key: &StoredKey) -> impl IntoElement {
                 )
                 .child(
                     div()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_full()
-                        .bg(match key.source {
-                            ProfileSource::SystemDiscovered => rgb(0x14532d),
-                            ProfileSource::AppManaged => rgb(0x7c2d12),
-                        })
-                        .text_xs()
-                        .child(source_label),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_full()
+                                .bg(match key.source {
+                                    ProfileSource::SystemDiscovered => rgb(0x14532d),
+                                    ProfileSource::AppManaged => rgb(0x7c2d12),
+                                })
+                                .text_xs()
+                                .child(source_label),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("identity-copy-{}", key.id)))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgb(0x0f172a))
+                                .border_1()
+                                .border_color(rgb(0x334155))
+                                .hover(|this| this.bg(rgb(0x1e293b)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let key_id = key.id.clone();
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.copy_identity_public_key(&key_id, cx);
+                                        }
+                                    }),
+                                )
+                                .child(div().text_xs().child("Copy")),
+                        ),
                 ),
         )
         .child(
@@ -3649,6 +4455,26 @@ fn render_identity_row(key: &StoredKey) -> impl IntoElement {
                     .child(format!("Fingerprint: {fingerprint}")),
             )
         })
+}
+
+fn identity_public_key_preview_body(key: &StoredKey) -> String {
+    let public_key_path = key.public_key_path.clone().or_else(|| {
+        key.path
+            .as_ref()
+            .map(|path| std::path::PathBuf::from(format!("{}.pub", path.display())))
+    });
+
+    match public_key_path {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => format!(
+                "Could not read public key.\n\nPath: {}\nError: {}",
+                path.display(),
+                error
+            ),
+        },
+        None => "No public key file is associated with this identity.".into(),
+    }
 }
 
 fn render_tunnel_input(
@@ -3678,6 +4504,7 @@ fn render_tunnel_input(
                 .rounded_md()
                 .cursor_pointer()
                 .bg(rgb(0x0f172a))
+                .font_family(".SystemUIFontMonospaced")
                 .border_1()
                 .border_color(if active { rgb(0x38bdf8) } else { rgb(0x1e293b) })
                 .hover(|this| this.bg(rgb(0x111827)))
@@ -3692,15 +4519,7 @@ fn render_tunnel_input(
                         .with_highlights([(0..value.len(), rgb(0x1d4ed8).into())])
                         .into_any_element()
                 } else if active {
-                    let (before, after) = split_at_char_offset(value, cursor_offset);
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .when(!before.is_empty(), |this| this.child(before))
-                        .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)).rounded_sm())
-                        .when(!after.is_empty(), |this| this.child(after))
-                        .into_any_element()
+                    render_inline_input_cursor(value, cursor_offset).into_any_element()
                 } else {
                     div()
                         .child(if value.is_empty() {
@@ -3721,10 +4540,18 @@ fn render_profile_input(
     cursor_offset: usize,
     editor_id: &str,
     field: ProfileFormField,
+    masked: bool,
+    placeholder: Option<&str>,
     cx: &mut Context<PuppyTermView>,
 ) -> impl IntoElement {
     let editor_id = editor_id.to_string();
     let label = label.to_string();
+    let display_value = if masked && !value.is_empty() {
+        "*".repeat(value.chars().count())
+    } else {
+        value.to_string()
+    };
+    let empty_display = placeholder.unwrap_or("<empty>").to_string();
 
     div()
         .child(div().text_sm().text_color(rgb(0x94a3b8)).child(label))
@@ -3740,6 +4567,7 @@ fn render_profile_input(
                 .rounded_md()
                 .cursor_pointer()
                 .bg(rgb(0x0f172a))
+                .font_family(".SystemUIFontMonospaced")
                 .border_1()
                 .border_color(if active { rgb(0x38bdf8) } else { rgb(0x1e293b) })
                 .hover(|this| this.bg(rgb(0x111827)))
@@ -3749,26 +4577,31 @@ fn render_profile_input(
                         this.focus_profile_field_at(&editor_id, field, event.position, window, cx);
                     }),
                 )
-                .child(if active && select_all && !value.is_empty() {
-                    StyledText::new(value.to_string())
-                        .with_highlights([(0..value.len(), rgb(0x1d4ed8).into())])
+                .child(if active && select_all && !display_value.is_empty() {
+                    StyledText::new(display_value.clone())
+                        .with_highlights([(0..display_value.len(), rgb(0x1d4ed8).into())])
                         .into_any_element()
                 } else if active {
-                    let (before, after) = split_at_char_offset(value, cursor_offset);
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .when(!before.is_empty(), |this| this.child(before))
-                        .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)).rounded_sm())
-                        .when(!after.is_empty(), |this| this.child(after))
-                        .into_any_element()
+                    if display_value.is_empty() && !empty_display.is_empty() {
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_color(rgb(0x64748b))
+                                    .child(empty_display.clone()),
+                            )
+                            .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)))
+                            .into_any_element()
+                    } else {
+                        render_inline_input_cursor(&display_value, cursor_offset).into_any_element()
+                    }
                 } else {
                     div()
-                        .child(if value.is_empty() {
-                            "<empty>".to_string()
+                        .child(if display_value.is_empty() {
+                            empty_display.clone()
                         } else {
-                            value.to_string()
+                            display_value.clone()
                         })
                         .into_any_element()
                 }),
@@ -3802,6 +4635,7 @@ fn render_identity_input(
                 .rounded_md()
                 .cursor_pointer()
                 .bg(rgb(0x0f172a))
+                .font_family(".SystemUIFontMonospaced")
                 .border_1()
                 .border_color(if active { rgb(0x38bdf8) } else { rgb(0x1e293b) })
                 .hover(|this| this.bg(rgb(0x111827)))
@@ -3816,15 +4650,7 @@ fn render_identity_input(
                         .with_highlights([(0..value.len(), rgb(0x1d4ed8).into())])
                         .into_any_element()
                 } else if active {
-                    let (before, after) = split_at_char_offset(value, cursor_offset);
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .when(!before.is_empty(), |this| this.child(before))
-                        .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)).rounded_sm())
-                        .when(!after.is_empty(), |this| this.child(after))
-                        .into_any_element()
+                    render_inline_input_cursor(value, cursor_offset).into_any_element()
                 } else {
                     div()
                         .child(if value.is_empty() {
@@ -3870,6 +4696,7 @@ fn render_identity_path_input(
                         .rounded_md()
                         .cursor_pointer()
                         .bg(rgb(0x0f172a))
+                        .font_family(".SystemUIFontMonospaced")
                         .border_1()
                         .border_color(if active { rgb(0x38bdf8) } else { rgb(0x1e293b) })
                         .hover(|this| this.bg(rgb(0x111827)))
@@ -3890,15 +4717,7 @@ fn render_identity_path_input(
                                 .with_highlights([(0..value.len(), rgb(0x1d4ed8).into())])
                                 .into_any_element()
                         } else if active {
-                            let (before, after) = split_at_char_offset(value, cursor_offset);
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .when(!before.is_empty(), |this| this.child(before))
-                                .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)).rounded_sm())
-                                .when(!after.is_empty(), |this| this.child(after))
-                                .into_any_element()
+                            render_inline_input_cursor(value, cursor_offset).into_any_element()
                         } else {
                             div()
                                 .child(if value.is_empty() {
@@ -3961,7 +4780,7 @@ fn profile_field_value_mut(
         ProfileFormField::Username => &mut editor.username,
         ProfileFormField::Port => &mut editor.port,
         ProfileFormField::IdentityPath => &mut editor.identity_path,
-        ProfileFormField::RemoteDirectory => &mut editor.remote_directory,
+        ProfileFormField::Password => &mut editor.password,
     }
 }
 
@@ -3972,7 +4791,7 @@ fn profile_field_value(editor: &ProfileEditorState, field: ProfileFormField) -> 
         ProfileFormField::Username => &editor.username,
         ProfileFormField::Port => &editor.port,
         ProfileFormField::IdentityPath => &editor.identity_path,
-        ProfileFormField::RemoteDirectory => &editor.remote_directory,
+        ProfileFormField::Password => &editor.password,
     }
 }
 
@@ -4120,6 +4939,16 @@ fn split_at_char_offset(value: &str, cursor_offset: usize) -> (String, String) {
         value[..byte_index].to_string(),
         value[byte_index..].to_string(),
     )
+}
+
+fn render_inline_input_cursor(value: &str, cursor_offset: usize) -> impl IntoElement {
+    let (before, after) = split_at_char_offset(value, cursor_offset);
+    div()
+        .flex()
+        .items_center()
+        .when(!before.is_empty(), |this| this.child(before))
+        .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)))
+        .when(!after.is_empty(), |this| this.child(after))
 }
 
 fn terminal_bytes_for_keystroke(event: &KeyDownEvent) -> Option<String> {
@@ -4362,7 +5191,13 @@ impl Render for PuppyTermView {
                                                     } else {
                                                         rgb(0x0f172a)
                                                     })
-                                                    .hover(|this| this.bg(rgb(0x1e293b)))
+                                                    .hover(move |this| {
+                                                        this.bg(if active {
+                                                            rgb(0x2563eb)
+                                                        } else {
+                                                            rgb(0x1e293b)
+                                                        })
+                                                    })
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.active_tab = tab_index;
                                                         cx.notify();
@@ -4385,8 +5220,12 @@ impl Render for PuppyTermView {
                                                                     .px_1()
                                                                     .rounded_sm()
                                                                     .text_color(rgb(0xe2e8f0))
-                                                                    .hover(|this| {
-                                                                        this.bg(rgb(0x334155))
+                                                                    .hover(move |this| {
+                                                                        this.bg(if active {
+                                                                            rgb(0x1d4ed8)
+                                                                        } else {
+                                                                            rgb(0x334155)
+                                                                        })
                                                                     })
                                                                     .on_click(cx.listener(
                                                                         move |this, _, _, cx| {
@@ -4402,25 +5241,6 @@ impl Render for PuppyTermView {
                                                     )
                                                     .into_any_element()
                                             }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("open-profile-picker")
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .bg(rgb(0x0f172a))
-                                            .hover(|this| this.bg(rgb(0x1e293b)))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_profile_picker(cx);
-                                            }))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .child("+"),
-                                            ),
                                     ),
                             )
                             .child(

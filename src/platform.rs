@@ -18,6 +18,7 @@ pub struct AppPaths {
     pub database: PathBuf,
     pub known_hosts: PathBuf,
     pub key_blobs: PathBuf,
+    pub secrets: PathBuf,
 }
 
 impl AppPaths {
@@ -30,6 +31,7 @@ impl AppPaths {
             database: base.join("puppyterm.sqlite3"),
             known_hosts: base.join("known_hosts"),
             key_blobs: base.join("key_blobs"),
+            secrets: base.join("secrets"),
         };
         paths.ensure()?;
         Ok(paths)
@@ -40,6 +42,8 @@ impl AppPaths {
             .with_context(|| format!("creating {}", self.root.display()))?;
         fs::create_dir_all(&self.key_blobs)
             .with_context(|| format!("creating {}", self.key_blobs.display()))?;
+        fs::create_dir_all(&self.secrets)
+            .with_context(|| format!("creating {}", self.secrets.display()))?;
         if !self.known_hosts.exists() {
             fs::write(&self.known_hosts, "")
                 .with_context(|| format!("initializing {}", self.known_hosts.display()))?;
@@ -103,6 +107,111 @@ impl SecretStore for KeyringSecretStore {
     fn unlock_status(&self) -> UnlockStatus {
         UnlockStatus::Available
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct HybridSecretStore {
+    keyring: KeyringSecretStore,
+    fallback_dir: PathBuf,
+    master_key: Vec<u8>,
+}
+
+impl HybridSecretStore {
+    pub fn new(service: impl Into<String>, paths: &AppPaths) -> Result<Self> {
+        let service = service.into();
+        let keyring = KeyringSecretStore::new(service);
+        let master_key =
+            load_or_create_master_key_with_fallback(&keyring, &paths.root.join("master_key.b64"))?;
+        Ok(Self {
+            keyring,
+            fallback_dir: paths.secrets.clone(),
+            master_key,
+        })
+    }
+
+    fn fallback_path(&self, key: &str) -> PathBuf {
+        let safe = key
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        self.fallback_dir.join(format!("{safe}.enc"))
+    }
+
+    fn write_fallback_secret(&self, key: &str, value: &str) -> Result<()> {
+        let path = self.fallback_path(key);
+        let payload = encrypt_blob(&self.master_key, value.as_bytes())?;
+        fs::write(&path, payload).with_context(|| format!("writing {}", path.display()))
+    }
+
+    fn read_fallback_secret(&self, key: &str) -> Result<Option<String>> {
+        let path = self.fallback_path(key);
+        let payload = match fs::read(&path) {
+            Ok(payload) => payload,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        let plaintext = decrypt_blob(&self.master_key, &payload)?;
+        Ok(Some(String::from_utf8(plaintext).context("decoding fallback secret as UTF-8")?))
+    }
+}
+
+impl SecretStore for HybridSecretStore {
+    fn put_secret(&self, key: &str, value: &str) -> Result<()> {
+        let _ = self.keyring.put_secret(key, value);
+        self.write_fallback_secret(key, value)
+    }
+
+    fn get_secret(&self, key: &str) -> Result<Option<String>> {
+        match self.keyring.get_secret(key) {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) | Err(_) => self.read_fallback_secret(key),
+        }
+    }
+
+    fn delete_secret(&self, key: &str) -> Result<()> {
+        let _ = self.keyring.delete_secret(key);
+        let path = self.fallback_path(key);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
+    fn unlock_status(&self) -> UnlockStatus {
+        UnlockStatus::Available
+    }
+}
+
+fn load_or_create_master_key_with_fallback(
+    keyring: &KeyringSecretStore,
+    fallback_path: &Path,
+) -> Result<Vec<u8>> {
+    if let Ok(Some(encoded)) = keyring.get_secret("master_key") {
+        return STANDARD
+            .decode(encoded)
+            .context("decoding keychain master key");
+    }
+
+    if let Ok(encoded) = fs::read_to_string(fallback_path) {
+        return STANDARD
+            .decode(encoded.trim())
+            .context("decoding fallback master key");
+    }
+
+    let mut bytes = vec![0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let encoded = STANDARD.encode(&bytes);
+    let _ = keyring.put_secret("master_key", &encoded);
+    fs::write(fallback_path, &encoded)
+        .with_context(|| format!("writing {}", fallback_path.display()))?;
+    Ok(bytes)
 }
 
 pub fn load_or_create_master_key(secret_store: &dyn SecretStore) -> Result<Vec<u8>> {
