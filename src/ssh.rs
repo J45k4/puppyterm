@@ -79,12 +79,30 @@ pub struct SftpResult {
 pub struct ManagedTunnel {
     pub spec: TunnelSpec,
     pub command_preview: String,
-    child: Arc<Mutex<Child>>,
+    process: ManagedTunnelProcess,
+}
+
+#[derive(Clone)]
+enum ManagedTunnelProcess {
+    Child(Arc<Mutex<Child>>),
+    Pty(TerminalSessionHandle),
 }
 
 impl ManagedTunnel {
     pub fn stop(&self) -> Result<()> {
-        self.child.lock().kill().context("stopping SSH tunnel")
+        match &self.process {
+            ManagedTunnelProcess::Child(child) => {
+                child.lock().kill().context("stopping SSH tunnel")
+            }
+            ManagedTunnelProcess::Pty(handle) => handle.terminate(),
+        }
+    }
+
+    pub fn session_handle(&self) -> Option<TerminalSessionHandle> {
+        match &self.process {
+            ManagedTunnelProcess::Pty(handle) => Some(handle.clone()),
+            ManagedTunnelProcess::Child(_) => None,
+        }
     }
 }
 
@@ -294,15 +312,12 @@ impl SshBackend for OpenSshBackend {
 
     fn start_tunnel(&self, profile: &HostProfile, spec: &TunnelSpec) -> Result<ManagedTunnel> {
         let preview = self.preview_tunnel_command(profile, spec);
-        let mut command = Command::new("ssh");
-        for arg in self.base_ssh_args(profile) {
-            command.arg(arg);
-        }
-        command.arg("-N");
+        let mut args = self.base_ssh_args(profile);
+        args.push("-N".into());
         match spec.mode {
             TunnelMode::Local => {
-                command.arg("-L");
-                command.arg(format!(
+                args.push("-L".into());
+                args.push(format!(
                     "{}:{}:{}:{}",
                     spec.bind_host,
                     spec.bind_port,
@@ -313,8 +328,8 @@ impl SshBackend for OpenSshBackend {
                 ));
             }
             TunnelMode::Remote => {
-                command.arg("-R");
-                command.arg(format!(
+                args.push("-R".into());
+                args.push(format!(
                     "{}:{}:{}:{}",
                     spec.bind_host,
                     spec.bind_port,
@@ -325,17 +340,26 @@ impl SshBackend for OpenSshBackend {
                 ));
             }
             TunnelMode::DynamicSocks => {
-                command.arg("-D");
-                command.arg(format!("{}:{}", spec.bind_host, spec.bind_port));
+                args.push("-D".into());
+                args.push(format!("{}:{}", spec.bind_host, spec.bind_port));
             }
         }
-        command.arg(self.connection_target(profile));
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = command.spawn().context("spawning SSH tunnel")?;
+        args.push(self.connection_target(profile));
+
+        let handle = self
+            .terminal
+            .spawn(TerminalCommand {
+                title: format!("Tunnel {}", spec.name),
+                program: "ssh".into(),
+                args,
+                env: Vec::new(),
+                cwd: None,
+            })
+            .context("spawning SSH tunnel")?;
         Ok(ManagedTunnel {
             spec: spec.clone(),
             command_preview: preview,
-            child: Arc::new(Mutex::new(child)),
+            process: ManagedTunnelProcess::Pty(handle),
         })
     }
 

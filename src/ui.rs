@@ -1530,6 +1530,7 @@ impl PuppyTermView {
     }
 
     fn delete_tunnel_rule(&mut self, tunnel_id: &str, cx: &mut Context<Self>) {
+        self.stop_tunnel_rule(tunnel_id, false, cx);
         match self.services.repository.delete_tunnel(tunnel_id) {
             Ok(()) => {
                 self.tunnels.retain(|tunnel| tunnel.id != tunnel_id);
@@ -1552,6 +1553,86 @@ impl PuppyTermView {
                 self.add_log(format!("Tunnel deletion failed: {error}"));
                 cx.notify();
             }
+        }
+    }
+
+    fn start_tunnel_rule(&mut self, tunnel_id: &str, cx: &mut Context<Self>) {
+        if self.live_tunnels.contains_key(tunnel_id) {
+            return;
+        }
+
+        let Some(tunnel) = self
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == tunnel_id)
+            .cloned()
+        else {
+            self.add_log(format!("Tunnel {} was not found.", tunnel_id));
+            cx.notify();
+            return;
+        };
+
+        let Some(profile) = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == tunnel.profile_id)
+            .cloned()
+        else {
+            self.add_log(format!("No SSH profile found for tunnel {}.", tunnel.name));
+            cx.notify();
+            return;
+        };
+
+        match self.services.ssh_backend.start_tunnel(&profile, &tunnel) {
+            Ok(managed) => {
+                let saved_password = match &profile.auth_method {
+                    AuthMethod::Password { secret_id } => self
+                        .services
+                        .secret_store
+                        .get_secret(secret_id)
+                        .ok()
+                        .flatten(),
+                    _ => None,
+                };
+                if let (Some(password), Some(handle)) = (saved_password, managed.session_handle()) {
+                    self.spawn_saved_password_autofill(handle, password);
+                }
+                self.live_tunnels.insert(tunnel.id.clone(), managed);
+                self.add_log(format!("Started tunnel {}.", tunnel.name));
+            }
+            Err(error) => {
+                self.add_log(format!("Tunnel start failed for {}: {error}", tunnel.name));
+            }
+        }
+        self.tunnel_context_menu = None;
+        cx.notify();
+    }
+
+    fn stop_tunnel_rule(&mut self, tunnel_id: &str, notify: bool, cx: &mut Context<Self>) {
+        let Some(managed) = self.live_tunnels.remove(tunnel_id) else {
+            if notify {
+                cx.notify();
+            }
+            return;
+        };
+
+        let tunnel_name = managed.spec.name.clone();
+        match managed.stop() {
+            Ok(()) => self.add_log(format!("Stopped tunnel {}.", tunnel_name)),
+            Err(error) => self.add_log(format!("Tunnel stop failed for {}: {error}", tunnel_name)),
+        }
+
+        self.tunnel_context_menu = None;
+        if notify {
+            cx.notify();
+        }
+    }
+
+    fn toggle_tunnel_rule(&mut self, tunnel_id: &str, cx: &mut Context<Self>) {
+        if self.live_tunnels.contains_key(tunnel_id) {
+            self.stop_tunnel_rule(tunnel_id, true, cx);
+        } else {
+            self.start_tunnel_rule(tunnel_id, cx);
         }
     }
 
@@ -2470,16 +2551,24 @@ impl PuppyTermView {
                                 .find(|profile| profile.id == tunnel.profile_id)
                                 .map(|profile| profile.display_name.clone())
                                 .unwrap_or_else(|| "Unknown profile".into());
+                            let is_running = self.live_tunnels.contains_key(&tunnel.id);
                             div()
                                 .id(SharedString::from(format!("tunnel-rule-{}", tunnel.id)))
                                 .p_3()
                                 .rounded_md()
                                 .cursor_pointer()
                                 .bg(rgb(0x1e293b))
+                                .border_1()
+                                .border_color(if is_running {
+                                    rgb(0x22c55e)
+                                } else {
+                                    rgb(0x1e293b)
+                                })
+                                .when(is_running, |this| this.shadow_lg())
                                 .hover(|this| this.bg(rgb(0x334155)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tunnel_context_menu = None;
-                                    this.open_tunnel_preview(&tunnel_id, cx);
+                                    this.toggle_tunnel_rule(&tunnel_id, cx);
                                 }))
                                 .on_mouse_down(
                                     MouseButton::Right,
@@ -2503,12 +2592,31 @@ impl PuppyTermView {
                                         )
                                         .child(
                                             div()
-                                                .px_2()
-                                                .py_0p5()
-                                                .rounded_full()
-                                                .bg(rgb(0x1d4ed8))
-                                                .text_xs()
-                                                .child(tunnel_mode_label(tunnel.mode)),
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_full()
+                                                        .bg(if is_running {
+                                                            rgb(0x166534)
+                                                        } else {
+                                                            rgb(0x0f172a)
+                                                        })
+                                                        .text_xs()
+                                                        .child(if is_running { "On" } else { "Off" }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_full()
+                                                        .bg(rgb(0x1d4ed8))
+                                                        .text_xs()
+                                                        .child(tunnel_mode_label(tunnel.mode)),
+                                                ),
                                         ),
                                 )
                                 .child(div().mt_1().text_xs().text_color(rgb(0xcbd5e1)).child(
@@ -2552,9 +2660,10 @@ impl PuppyTermView {
                                                         .rounded_md()
                                                         .cursor_pointer()
                                                         .hover(|this| this.bg(rgb(0x1e293b)))
-                                                        .on_click(cx.listener({
+                                                        .on_mouse_down(MouseButton::Left, cx.listener({
                                                             let tunnel_id = tunnel.id.clone();
                                                             move |this, _, _, cx| {
+                                                                cx.stop_propagation();
                                                                 this.edit_tunnel_rule(
                                                                     &tunnel_id, cx,
                                                                 );
@@ -2576,9 +2685,10 @@ impl PuppyTermView {
                                                 .cursor_pointer()
                                                 .hover(|this| this.bg(rgb(0x3f1d24)))
                                                 .text_color(rgb(0xfca5a5))
-                                                .on_click(cx.listener({
+                                                .on_mouse_down(MouseButton::Left, cx.listener({
                                                     let tunnel_id = tunnel.id.clone();
                                                     move |this, _, _, cx| {
+                                                        cx.stop_propagation();
                                                         this.delete_tunnel_rule(&tunnel_id, cx);
                                                     }
                                                 }))
