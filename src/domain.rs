@@ -191,3 +191,64 @@ pub struct SystemProfileIndex {
     pub keys: Vec<StoredKey>,
     pub known_hosts: Vec<KnownHostEntry>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub download_url: String,
+    pub signature_url: String,
+    pub os: String,
+    pub arch: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseInfo {
+    pub id: u64,
+    pub tag_name: String,
+    pub published_at: String,
+    pub html_url: String,
+    pub notes: String,
+    pub assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingInstall {
+    pub release_id: u64,
+    pub tag_name: String,
+    pub staged_path: PathBuf,
+    pub release_notes_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UpdateCheckResult {
+    UpToDate,
+    UpdateAvailable,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateState {
+    pub last_checked_at: Option<String>,
+    pub check_in_progress: bool,
+    pub available_release_id: Option<u64>,
+    pub dismissed_release_id: Option<u64>,
+    pub downloaded_release_id: Option<u64>,
+    pub pending_install: Option<PendingInstall>,
+    pub last_result: Option<UpdateCheckResult>,
+    pub available_release: Option<ReleaseInfo>,
+}
+
+impl Default for UpdateState {
+    fn default() -> Self {
+        Self {
+            last_checked_at: None,
+            check_in_progress: false,
+            available_release_id: None,
+            dismissed_release_id: None,
+            downloaded_release_id: None,
+            pending_install: None,
+            last_result: None,
+            available_release: None,
+        }
+    }
+}

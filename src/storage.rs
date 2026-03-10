@@ -6,7 +6,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::domain::{HostProfile, ProfileSource, SessionRecord, StoredKey, TunnelSpec};
+use crate::domain::{
+    HostProfile, ProfileSource, SessionRecord, StoredKey, TunnelSpec, UpdateState,
+};
 
 pub trait ProfileRepository: Send + Sync {
     fn load_app_profiles(&self) -> Result<Vec<HostProfile>>;
@@ -19,6 +21,8 @@ pub trait ProfileRepository: Send + Sync {
     fn delete_tunnel(&self, tunnel_id: &str) -> Result<()>;
     fn recent_sessions(&self) -> Result<Vec<SessionRecord>>;
     fn record_session(&self, session: &SessionRecord) -> Result<()>;
+    fn load_update_state(&self) -> Result<UpdateState>;
+    fn save_update_state(&self, state: &UpdateState) -> Result<()>;
 }
 
 pub struct SqliteProfileRepository {
@@ -64,6 +68,11 @@ impl SqliteProfileRepository {
                 id TEXT PRIMARY KEY,
                 profile_id TEXT NOT NULL,
                 started_at TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS updater_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
                 data TEXT NOT NULL
             );
             "#,
@@ -186,6 +195,30 @@ impl ProfileRepository for SqliteProfileRepository {
         )?;
         Ok(())
     }
+
+    fn load_update_state(&self) -> Result<UpdateState> {
+        let payload = self
+            .connection
+            .lock()
+            .query_row("SELECT data FROM updater_state WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        match payload {
+            Some(payload) => Ok(serde_json::from_str(&payload)?),
+            None => Ok(UpdateState::default()),
+        }
+    }
+
+    fn save_update_state(&self, state: &UpdateState) -> Result<()> {
+        let payload = serde_json::to_string(state)?;
+        self.connection.lock().execute(
+            "INSERT INTO updater_state (id, data) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            params![payload],
+        )?;
+        Ok(())
+    }
 }
 
 fn extract_column<T: Serialize>(value: &T, column: &str) -> Result<String> {
@@ -214,7 +247,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ProfileRepository, SqliteProfileRepository};
-    use crate::domain::{HostProfile, RecordMeta, TunnelMode, TunnelSpec};
+    use crate::domain::{
+        HostProfile, RecordMeta, TunnelMode, TunnelSpec, UpdateCheckResult, UpdateState,
+    };
 
     #[test]
     fn stores_and_loads_app_profiles() -> Result<()> {
@@ -267,6 +302,29 @@ mod tests {
 
         repo.delete_tunnel(&tunnel.id)?;
         assert!(repo.list_tunnels()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stores_and_loads_update_state() -> Result<()> {
+        let temp = tempdir()?;
+        let repo = SqliteProfileRepository::open(temp.path().join("data.sqlite"))?;
+
+        let state = UpdateState {
+            last_checked_at: Some("2026-03-09T10:00:00Z".into()),
+            check_in_progress: false,
+            available_release_id: Some(42),
+            dismissed_release_id: None,
+            downloaded_release_id: Some(42),
+            pending_install: None,
+            last_result: Some(UpdateCheckResult::UpdateAvailable),
+            available_release: None,
+        };
+        repo.save_update_state(&state)?;
+
+        let loaded = repo.load_update_state()?;
+        assert_eq!(loaded.available_release_id, Some(42));
+        assert_eq!(loaded.last_result, Some(UpdateCheckResult::UpdateAvailable));
         Ok(())
     }
 }

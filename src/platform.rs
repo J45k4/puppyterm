@@ -19,6 +19,7 @@ pub struct AppPaths {
     pub known_hosts: PathBuf,
     pub key_blobs: PathBuf,
     pub secrets: PathBuf,
+    pub updates: PathBuf,
 }
 
 impl AppPaths {
@@ -32,6 +33,7 @@ impl AppPaths {
             known_hosts: base.join("known_hosts"),
             key_blobs: base.join("key_blobs"),
             secrets: base.join("secrets"),
+            updates: base.join("updates"),
         };
         paths.ensure()?;
         Ok(paths)
@@ -44,6 +46,8 @@ impl AppPaths {
             .with_context(|| format!("creating {}", self.key_blobs.display()))?;
         fs::create_dir_all(&self.secrets)
             .with_context(|| format!("creating {}", self.secrets.display()))?;
+        fs::create_dir_all(&self.updates)
+            .with_context(|| format!("creating {}", self.updates.display()))?;
         if !self.known_hosts.exists() {
             fs::write(&self.known_hosts, "")
                 .with_context(|| format!("initializing {}", self.known_hosts.display()))?;
@@ -157,7 +161,9 @@ impl HybridSecretStore {
             Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
         let plaintext = decrypt_blob(&self.master_key, &payload)?;
-        Ok(Some(String::from_utf8(plaintext).context("decoding fallback secret as UTF-8")?))
+        Ok(Some(
+            String::from_utf8(plaintext).context("decoding fallback secret as UTF-8")?,
+        ))
     }
 }
 

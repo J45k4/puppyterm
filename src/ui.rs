@@ -10,10 +10,14 @@ use uuid::Uuid;
 
 use crate::{
     app::{BootState, PuppyTermServices},
-    domain::{AuthMethod, HostProfile, ProfileSource, StoredKey, SystemProfileIndex, TunnelMode, TunnelSpec},
+    domain::{
+        AuthMethod, HostProfile, ProfileSource, StoredKey, SystemProfileIndex, TunnelMode,
+        TunnelSpec, UpdateCheckResult, UpdateState,
+    },
     interop::scan_default_ssh_assets,
     ssh::{ManagedTunnel, SftpOperation},
     terminal::TerminalSessionHandle,
+    updater::InstalledBuild,
 };
 
 const SIDEBAR_LOGO_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/puppyterm.png");
@@ -60,6 +64,10 @@ pub struct PuppyTermView {
     recent_sessions: Vec<crate::domain::SessionRecord>,
     binary_status: crate::ssh::BinaryStatus,
     startup_error: Option<String>,
+    update_state: UpdateState,
+    installed_build: InstalledBuild,
+    show_update_banner: bool,
+    update_activity_label: Option<String>,
     tabs: Vec<WorkspaceTab>,
     active_tab: usize,
     log_lines: Vec<String>,
@@ -246,6 +254,10 @@ impl PuppyTermView {
             recent_sessions: boot.recent_sessions,
             binary_status: boot.binary_status,
             startup_error: boot.startup_error,
+            update_state: boot.update_state,
+            installed_build: boot.installed_build,
+            show_update_banner: false,
+            update_activity_label: None,
             tabs: vec![WorkspaceTab {
                 id: "menu".into(),
                 title: "Menu".into(),
@@ -293,6 +305,8 @@ impl PuppyTermView {
         })
         .detach();
 
+        let mut this = this;
+        this.begin_update_check(false, false, cx);
         this
     }
 
@@ -391,6 +405,189 @@ impl PuppyTermView {
             cursor_offset: 0,
             select_all: false,
             error: None,
+        }
+    }
+
+    fn persist_update_state(&mut self) {
+        if let Err(error) = self
+            .services
+            .repository
+            .save_update_state(&self.update_state)
+        {
+            self.add_log(format!("Update state save failed: {error}"));
+        }
+    }
+
+    fn should_show_update_banner(&self) -> bool {
+        if self.update_state.check_in_progress {
+            return true;
+        }
+        if self.update_state.pending_install.is_some() {
+            return self.show_update_banner;
+        }
+
+        if matches!(
+            self.update_state.last_result,
+            Some(UpdateCheckResult::UpToDate | UpdateCheckResult::Failed(_))
+        ) {
+            return self.show_update_banner;
+        }
+
+        self.update_state
+            .available_release
+            .as_ref()
+            .is_some_and(|release| Some(release.id) != self.update_state.dismissed_release_id)
+            && self.show_update_banner
+    }
+
+    fn begin_update_check(&mut self, force: bool, show_banner: bool, cx: &mut Context<Self>) {
+        if self.update_state.check_in_progress {
+            return;
+        }
+
+        self.update_state.check_in_progress = true;
+        self.update_activity_label = Some("Checking for updates...".into());
+        if force {
+            self.update_state.dismissed_release_id = None;
+        }
+        if show_banner {
+            self.show_update_banner = true;
+        }
+        self.persist_update_state();
+        cx.notify();
+
+        let updater = Arc::clone(&self.services.updater);
+        let repository = Arc::clone(&self.services.repository);
+        let build = self.installed_build.clone();
+        let state = self.update_state.clone();
+
+        cx.spawn(async move |this_entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { updater.check_for_updates(state, force, &build) })
+                .await;
+
+            let _ = this_entity.update(cx, |this, cx| {
+                this.update_activity_label = None;
+                match result {
+                    Ok(state) => {
+                        this.update_state = state;
+                        let has_available = this
+                            .update_state
+                            .available_release
+                            .as_ref()
+                            .is_some_and(|release| {
+                                Some(release.id) != this.update_state.dismissed_release_id
+                            });
+                        this.show_update_banner = if show_banner {
+                            true
+                        } else {
+                            has_available
+                                || this.update_state.pending_install.is_some()
+                                || matches!(
+                                    this.update_state.last_result,
+                                    Some(UpdateCheckResult::Failed(_))
+                                )
+                        };
+                    }
+                    Err(error) => {
+                        this.update_state.check_in_progress = false;
+                        this.update_state.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
+                        this.update_state.last_result =
+                            Some(UpdateCheckResult::Failed(error.to_string()));
+                        this.show_update_banner = true;
+                    }
+                }
+                if let Err(error) = repository.save_update_state(&this.update_state) {
+                    this.add_log(format!("Update state save failed: {error}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn download_available_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_state.check_in_progress || self.update_state.available_release.is_none() {
+            return;
+        }
+
+        self.update_state.check_in_progress = true;
+        self.update_activity_label = Some("Downloading and verifying update...".into());
+        self.show_update_banner = true;
+        self.persist_update_state();
+        cx.notify();
+
+        let updater = Arc::clone(&self.services.updater);
+        let repository = Arc::clone(&self.services.repository);
+        let build = self.installed_build.clone();
+        let state = self.update_state.clone();
+
+        cx.spawn(async move |this_entity, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { updater.download_available_update(state, &build) })
+                .await;
+
+            let _ = this_entity.update(cx, |this, cx| {
+                this.update_activity_label = None;
+                match result {
+                    Ok(mut state) => {
+                        state.check_in_progress = false;
+                        this.update_state = state;
+                        this.show_update_banner = true;
+                        this.add_log("Downloaded and verified update payload.");
+                    }
+                    Err(error) => {
+                        this.update_state.check_in_progress = false;
+                        this.update_state.last_result =
+                            Some(UpdateCheckResult::Failed(error.to_string()));
+                        this.show_update_banner = true;
+                        this.add_log(format!("Update download failed: {error}"));
+                    }
+                }
+                if let Err(error) = repository.save_update_state(&this.update_state) {
+                    this.add_log(format!("Update state save failed: {error}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn install_pending_update(&mut self, cx: &mut Context<Self>) {
+        match self
+            .services
+            .updater
+            .apply_pending_update(&self.update_state, &self.installed_build)
+        {
+            Ok(()) => {}
+            Err(error) => {
+                self.update_state.last_result = Some(UpdateCheckResult::Failed(error.to_string()));
+                self.show_update_banner = true;
+                self.add_log(format!("Update install failed: {error}"));
+                self.persist_update_state();
+                cx.notify();
+            }
+        }
+    }
+
+    fn dismiss_update_banner(&mut self, cx: &mut Context<Self>) {
+        if let Some(release_id) = self.update_state.available_release_id {
+            self.update_state.dismissed_release_id = Some(release_id);
+        }
+        self.show_update_banner = false;
+        self.persist_update_state();
+        cx.notify();
+    }
+
+    fn open_update_release_notes(&self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.update_state.pending_install.as_ref() {
+            cx.open_url(&pending.release_notes_url);
+            return;
+        }
+        if let Some(release) = self.update_state.available_release.as_ref() {
+            cx.open_url(&release.html_url);
         }
     }
 
@@ -1138,8 +1335,7 @@ impl PuppyTermView {
                         .password_secret_id
                         .clone()
                         .unwrap_or_else(|| format!("profile-password-{}", profile.id));
-                    if let Err(error) =
-                        self.services.secret_store.put_secret(&secret_id, &password)
+                    if let Err(error) = self.services.secret_store.put_secret(&secret_id, &password)
                     {
                         editor.error = Some(format!("Could not save password: {error}"));
                         cx.notify();
@@ -1153,7 +1349,10 @@ impl PuppyTermView {
 
         match self.services.repository.upsert_profile(&profile) {
             Ok(()) => {
-                if let Some(existing) = self.app_profiles.iter_mut().find(|item| item.id == profile.id)
+                if let Some(existing) = self
+                    .app_profiles
+                    .iter_mut()
+                    .find(|item| item.id == profile.id)
                 {
                     *existing = profile.clone();
                 } else {
@@ -2606,7 +2805,11 @@ impl PuppyTermView {
                                                             rgb(0x0f172a)
                                                         })
                                                         .text_xs()
-                                                        .child(if is_running { "On" } else { "Off" }),
+                                                        .child(if is_running {
+                                                            "On"
+                                                        } else {
+                                                            "Off"
+                                                        }),
                                                 )
                                                 .child(
                                                     div()
@@ -2660,15 +2863,18 @@ impl PuppyTermView {
                                                         .rounded_md()
                                                         .cursor_pointer()
                                                         .hover(|this| this.bg(rgb(0x1e293b)))
-                                                        .on_mouse_down(MouseButton::Left, cx.listener({
-                                                            let tunnel_id = tunnel.id.clone();
-                                                            move |this, _, _, cx| {
-                                                                cx.stop_propagation();
-                                                                this.edit_tunnel_rule(
-                                                                    &tunnel_id, cx,
-                                                                );
-                                                            }
-                                                        }))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener({
+                                                                let tunnel_id = tunnel.id.clone();
+                                                                move |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.edit_tunnel_rule(
+                                                                        &tunnel_id, cx,
+                                                                    );
+                                                                }
+                                                            }),
+                                                        )
                                                         .child("Edit"),
                                                 ),
                                         )
@@ -2685,13 +2891,16 @@ impl PuppyTermView {
                                                 .cursor_pointer()
                                                 .hover(|this| this.bg(rgb(0x3f1d24)))
                                                 .text_color(rgb(0xfca5a5))
-                                                .on_mouse_down(MouseButton::Left, cx.listener({
-                                                    let tunnel_id = tunnel.id.clone();
-                                                    move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.delete_tunnel_rule(&tunnel_id, cx);
-                                                    }
-                                                }))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener({
+                                                        let tunnel_id = tunnel.id.clone();
+                                                        move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.delete_tunnel_rule(&tunnel_id, cx);
+                                                        }
+                                                    }),
+                                                )
                                                 .child("Delete"),
                                         )
                                     },
@@ -3988,6 +4197,361 @@ impl PuppyTermView {
             )
     }
 
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.should_show_update_banner() {
+            return None;
+        }
+
+        let mut message = self
+            .update_activity_label
+            .clone()
+            .unwrap_or_else(|| "Working on update...".into());
+        let mut release_notes_url = None::<String>;
+        let mut release_available = false;
+        let mut install_ready = false;
+
+        if let Some(pending) = self.update_state.pending_install.as_ref() {
+            install_ready = true;
+            message = format!("Update {} is ready to install.", pending.tag_name);
+            release_notes_url = Some(pending.release_notes_url.clone());
+        } else if let Some(release) = self.update_state.available_release.as_ref() {
+            if Some(release.id) != self.update_state.dismissed_release_id {
+                release_available = true;
+                message = format!("Update {} is available.", release.tag_name);
+                release_notes_url = Some(release.html_url.clone());
+            }
+        } else if let Some(result) = self.update_state.last_result.as_ref() {
+            match result {
+                UpdateCheckResult::UpToDate => {
+                    message = format!(
+                        "PuppyTerm {} is already up to date.",
+                        self.installed_build.version
+                    );
+                }
+                UpdateCheckResult::Failed(error) => {
+                    message = format!("Update check failed: {error}");
+                }
+                UpdateCheckResult::UpdateAvailable => {}
+            }
+        }
+
+        Some(
+            div()
+                .id("update-banner")
+                .mx_4()
+                .mt_4()
+                .rounded_lg()
+                .border_1()
+                .border_color(if install_ready {
+                    rgb(0x16a34a)
+                } else if matches!(
+                    self.update_state.last_result,
+                    Some(UpdateCheckResult::Failed(_))
+                ) {
+                    rgb(0xdc2626)
+                } else {
+                    rgb(0x1d4ed8)
+                })
+                .bg(rgb(0x0f172a))
+                .p_4()
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(message),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .when(self.update_state.check_in_progress, |this| {
+                                    this.child(
+                                        div()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .bg(rgb(0x111827))
+                                            .text_color(rgb(0x94a3b8))
+                                            .child("Working..."),
+                                    )
+                                })
+                                .when(
+                                    release_available && !self.update_state.check_in_progress,
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .id("download-update-button")
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(rgb(0x1d4ed8))
+                                                .hover(|this| this.bg(rgb(0x2563eb)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.download_available_update(cx);
+                                                    }),
+                                                )
+                                                .child("Download Update"),
+                                        )
+                                    },
+                                )
+                                .when(
+                                    install_ready && !self.update_state.check_in_progress,
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .id("install-update-button")
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(rgb(0x15803d))
+                                                .hover(|this| this.bg(rgb(0x16a34a)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.install_pending_update(cx);
+                                                    }),
+                                                )
+                                                .child("Install and Restart"),
+                                        )
+                                    },
+                                )
+                                .when_some(release_notes_url, |this, _| {
+                                    this.child(
+                                        div()
+                                            .id("view-release-notes-button")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(rgb(0x111827))
+                                            .border_1()
+                                            .border_color(rgb(0x334155))
+                                            .hover(|this| this.bg(rgb(0x1e293b)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.open_update_release_notes(cx);
+                                                }),
+                                            )
+                                            .child("View Release Notes"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id("dismiss-update-button")
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x111827))
+                                        .border_1()
+                                        .border_color(rgb(0x334155))
+                                        .hover(|this| this.bg(rgb(0x1e293b)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.dismiss_update_banner(cx);
+                                            }),
+                                        )
+                                        .child("Dismiss"),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_sidebar_update_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut status_text = self
+            .update_activity_label
+            .clone()
+            .unwrap_or_else(|| "No update activity yet.".into());
+        let mut release_notes_url = None::<String>;
+        let mut release_available = false;
+        let mut install_ready = false;
+
+        if let Some(pending) = self.update_state.pending_install.as_ref() {
+            install_ready = true;
+            status_text = format!("Ready: {}", pending.tag_name);
+            release_notes_url = Some(pending.release_notes_url.clone());
+        } else if let Some(release) = self.update_state.available_release.as_ref() {
+            if Some(release.id) != self.update_state.dismissed_release_id {
+                release_available = true;
+                status_text = format!("Available: {}", release.tag_name);
+                release_notes_url = Some(release.html_url.clone());
+            }
+        } else if let Some(result) = self.update_state.last_result.as_ref() {
+            match result {
+                UpdateCheckResult::UpToDate => {
+                    status_text = format!("Up to date ({})", self.installed_build.version);
+                }
+                UpdateCheckResult::Failed(error) => {
+                    status_text = format!("Update check failed: {error}");
+                }
+                UpdateCheckResult::UpdateAvailable => {}
+            }
+        }
+
+        div()
+            .mt_auto()
+            .pt_4()
+            .child(div().text_xs().text_color(rgb(0x94a3b8)).child("Updates"))
+            .child(
+                div()
+                    .mt_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(if install_ready {
+                        rgb(0x16a34a)
+                    } else if matches!(
+                        self.update_state.last_result,
+                        Some(UpdateCheckResult::Failed(_))
+                    ) {
+                        rgb(0xdc2626)
+                    } else {
+                        rgb(0x1e293b)
+                    })
+                    .bg(rgb(0x0f172a))
+                    .p_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("PuppyTerm"),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(0xcbd5e1))
+                            .child(status_text),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("sidebar-check-updates-button")
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(0x111827))
+                                    .border_1()
+                                    .border_color(rgb(0x334155))
+                                    .hover(|this| this.bg(rgb(0x1e293b)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.begin_update_check(true, true, cx);
+                                        }),
+                                    )
+                                    .child("Check for Updates"),
+                            )
+                            .when(
+                                release_available && !self.update_state.check_in_progress,
+                                |this| {
+                                    this.child(
+                                        div()
+                                            .id("sidebar-download-update-button")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(rgb(0x1d4ed8))
+                                            .hover(|this| this.bg(rgb(0x2563eb)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.download_available_update(cx);
+                                                }),
+                                            )
+                                            .child("Download Update"),
+                                    )
+                                },
+                            )
+                            .when(
+                                install_ready && !self.update_state.check_in_progress,
+                                |this| {
+                                    this.child(
+                                        div()
+                                            .id("sidebar-install-update-button")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(rgb(0x15803d))
+                                            .hover(|this| this.bg(rgb(0x16a34a)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.install_pending_update(cx);
+                                                }),
+                                            )
+                                            .child("Install and Restart"),
+                                    )
+                                },
+                            )
+                            .when_some(release_notes_url, |this, _| {
+                                this.child(
+                                    div()
+                                        .id("sidebar-view-release-notes-button")
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x111827))
+                                        .border_1()
+                                        .border_color(rgb(0x334155))
+                                        .hover(|this| this.bg(rgb(0x1e293b)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.open_update_release_notes(cx);
+                                            }),
+                                        )
+                                        .child("View Release Notes"),
+                                )
+                            })
+                            .when(self.should_show_update_banner(), |this| {
+                                this.child(
+                                    div()
+                                        .id("sidebar-dismiss-update-button")
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x111827))
+                                        .border_1()
+                                        .border_color(rgb(0x334155))
+                                        .hover(|this| this.bg(rgb(0x1e293b)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.dismiss_update_banner(cx);
+                                            }),
+                                        )
+                                        .child("Dismiss"),
+                                )
+                            }),
+                    ),
+            )
+    }
+
     fn render_ssh_profile_row(
         &self,
         profile: &HostProfile,
@@ -3998,7 +4562,10 @@ impl PuppyTermView {
         let profile_id = profile.id.clone();
 
         div()
-            .id(SharedString::from(format!("connect-profile-{}", profile.id)))
+            .id(SharedString::from(format!(
+                "connect-profile-{}",
+                profile.id
+            )))
             .p_3()
             .rounded_md()
             .cursor_pointer()
@@ -4088,13 +4655,16 @@ impl PuppyTermView {
                                     .rounded_md()
                                     .cursor_pointer()
                                     .hover(|this| this.bg(rgb(0x1e293b)))
-                                    .on_mouse_down(MouseButton::Left, cx.listener({
-                                        let profile_id = profile.id.clone();
-                                        move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.edit_profile_config(&profile_id, cx);
-                                        }
-                                    }))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener({
+                                            let profile_id = profile.id.clone();
+                                            move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.edit_profile_config(&profile_id, cx);
+                                            }
+                                        }),
+                                    )
                                     .child("Edit"),
                             ),
                     )
@@ -4707,11 +5277,7 @@ fn render_profile_input(
                         div()
                             .flex()
                             .items_center()
-                            .child(
-                                div()
-                                    .text_color(rgb(0x64748b))
-                                    .child(empty_display.clone()),
-                            )
+                            .child(div().text_color(rgb(0x64748b)).child(empty_display.clone()))
                             .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)))
                             .into_any_element()
                     } else {
@@ -5213,7 +5779,8 @@ impl Render for PuppyTermView {
                             .w(self.sidebar_width)
                             .h_full()
                             .p_4()
-                            .overflow_scroll()
+                            .flex()
+                            .flex_col()
                             .bg(rgb(0x111827))
                             .child(
                                 div().w_full().flex().justify_center().child(
@@ -5259,7 +5826,8 @@ impl Render for PuppyTermView {
                                         MenuSection::Sftp,
                                         cx,
                                     )),
-                            ),
+                            )
+                            .child(self.render_sidebar_update_panel(cx)),
                     )
                     .child(
                         div()
@@ -5289,79 +5857,80 @@ impl Render for PuppyTermView {
                                     .px_4()
                                     .py_3()
                                     .flex()
-                                    .gap_2()
                                     .border_b_1()
                                     .border_color(rgb(0x1f2937))
-                                    .children(
-                                        self.tabs
-                                            .iter()
-                                            .enumerate()
-                                            .filter(|(_, tab)| Self::tab_is_closable(tab))
-                                            .map(|(index, tab)| {
-                                                let active = self.active_tab == index;
-                                                let tab_index = index;
-                                                let close_index = index;
-                                                div()
-                                                    .id(SharedString::from(tab.id.clone()))
-                                                    .px_3()
-                                                    .py_2()
-                                                    .rounded_md()
-                                                    .cursor_pointer()
-                                                    .bg(if active {
-                                                        rgb(0x1d4ed8)
-                                                    } else {
-                                                        rgb(0x0f172a)
-                                                    })
-                                                    .hover(move |this| {
-                                                        this.bg(if active {
-                                                            rgb(0x2563eb)
+                                    .child(
+                                        div().flex().gap_2().children(
+                                            self.tabs
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, tab)| Self::tab_is_closable(tab))
+                                                .map(|(index, tab)| {
+                                                    let active = self.active_tab == index;
+                                                    let tab_index = index;
+                                                    let close_index = index;
+                                                    div()
+                                                        .id(SharedString::from(tab.id.clone()))
+                                                        .px_3()
+                                                        .py_2()
+                                                        .rounded_md()
+                                                        .cursor_pointer()
+                                                        .bg(if active {
+                                                            rgb(0x1d4ed8)
                                                         } else {
-                                                            rgb(0x1e293b)
+                                                            rgb(0x0f172a)
                                                         })
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.active_tab = tab_index;
-                                                        cx.notify();
-                                                    }))
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .child(
-                                                                div()
-                                                                    .text_sm()
-                                                                    .child(tab.title.clone()),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id(SharedString::from(
-                                                                        format!("{}-close", tab.id),
-                                                                    ))
-                                                                    .px_1()
-                                                                    .rounded_sm()
-                                                                    .text_color(rgb(0xe2e8f0))
-                                                                    .hover(move |this| {
-                                                                        this.bg(if active {
-                                                                            rgb(0x1d4ed8)
-                                                                        } else {
-                                                                            rgb(0x334155)
+                                                        .hover(move |this| {
+                                                            this.bg(if active {
+                                                                rgb(0x2563eb)
+                                                            } else {
+                                                                rgb(0x1e293b)
+                                                            })
+                                                        })
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.active_tab = tab_index;
+                                                            cx.notify();
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_2()
+                                                                .child(
+                                                                    div()
+                                                                        .text_sm()
+                                                                        .child(tab.title.clone()),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .id(SharedString::from(
+                                                                            format!("{}-close", tab.id),
+                                                                        ))
+                                                                        .px_1()
+                                                                        .rounded_sm()
+                                                                        .text_color(rgb(0xe2e8f0))
+                                                                        .hover(move |this| {
+                                                                            this.bg(if active {
+                                                                                rgb(0x1d4ed8)
+                                                                            } else {
+                                                                                rgb(0x334155)
+                                                                            })
                                                                         })
-                                                                    })
-                                                                    .on_click(cx.listener(
-                                                                        move |this, _, _, cx| {
-                                                                            cx.stop_propagation();
-                                                                            this.close_tab(
-                                                                                close_index,
-                                                                                cx,
-                                                                            );
-                                                                        },
-                                                                    ))
-                                                                    .child("x"),
-                                                            ),
-                                                    )
-                                                    .into_any_element()
-                                            }),
+                                                                        .on_click(cx.listener(
+                                                                            move |this, _, _, cx| {
+                                                                                cx.stop_propagation();
+                                                                                this.close_tab(
+                                                                                    close_index,
+                                                                                    cx,
+                                                                                );
+                                                                            },
+                                                                        ))
+                                                                        .child("x"),
+                                                                ),
+                                                        )
+                                                        .into_any_element()
+                                                }),
+                                        ),
                                     ),
                             )
                             .child(

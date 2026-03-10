@@ -7,12 +7,13 @@ use gpui::{
 };
 
 use crate::{
-    domain::{SessionRecord, StoredKey, SystemProfileIndex, TunnelSpec},
+    domain::{SessionRecord, StoredKey, SystemProfileIndex, TunnelSpec, UpdateState},
     interop::scan_default_ssh_assets,
     platform::{AppPaths, HybridSecretStore, SecretStore},
     ssh::{BinaryStatus, OpenSshBackend, SshBackend},
     storage::{ProfileRepository, SqliteProfileRepository},
     ui::PuppyTermView,
+    updater::{GitHubUpdater, InstalledBuild},
 };
 
 const APP_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/puppyterm.png");
@@ -23,6 +24,7 @@ pub struct PuppyTermServices {
     pub secret_store: Arc<dyn SecretStore>,
     pub repository: Arc<dyn ProfileRepository>,
     pub ssh_backend: Arc<dyn SshBackend>,
+    pub updater: Arc<GitHubUpdater>,
 }
 
 pub struct BootState {
@@ -33,6 +35,8 @@ pub struct BootState {
     pub tunnels: Vec<TunnelSpec>,
     pub recent_sessions: Vec<SessionRecord>,
     pub binary_status: BinaryStatus,
+    pub update_state: UpdateState,
+    pub installed_build: InstalledBuild,
     pub startup_error: Option<String>,
 }
 
@@ -47,21 +51,27 @@ impl BootState {
                     known_hosts: std::env::temp_dir().join("known_hosts"),
                     key_blobs: std::env::temp_dir().join("key_blobs"),
                     secrets: std::env::temp_dir().join("puppyterm-secrets"),
+                    updates: std::env::temp_dir().join("puppyterm-updates"),
                 });
-                let secret_store: Arc<dyn SecretStore> =
-                    Arc::new(HybridSecretStore::new("com.puppyterm.app", &paths).expect(
-                        "boot fallback secret store should be creatable",
-                    ));
+                let secret_store: Arc<dyn SecretStore> = Arc::new(
+                    HybridSecretStore::new("com.puppyterm.app", &paths)
+                        .expect("boot fallback secret store should be creatable"),
+                );
                 let repository: Arc<dyn ProfileRepository> = Arc::new(
                     SqliteProfileRepository::open(&paths.database)
                         .expect("boot fallback repository should be creatable"),
                 );
                 let backend: Arc<dyn SshBackend> = Arc::new(OpenSshBackend::new(paths.clone()));
+                let updater = Arc::new(
+                    GitHubUpdater::new(paths.clone())
+                        .expect("boot fallback updater should be creatable"),
+                );
                 let services = Arc::new(PuppyTermServices {
                     paths,
                     secret_store,
                     repository,
                     ssh_backend: Arc::clone(&backend),
+                    updater: Arc::clone(&updater),
                 });
                 Self {
                     services,
@@ -75,6 +85,8 @@ impl BootState {
                     tunnels: Vec::new(),
                     recent_sessions: Vec::new(),
                     binary_status: backend.ssh_status(),
+                    update_state: UpdateState::default(),
+                    installed_build: updater.current_build(),
                     startup_error: Some(error.to_string()),
                 }
             }
@@ -109,11 +121,13 @@ fn load_boot_state() -> Result<BootState> {
     let repository: Arc<dyn ProfileRepository> =
         Arc::new(SqliteProfileRepository::open(&paths.database)?);
     let backend: Arc<dyn SshBackend> = Arc::new(OpenSshBackend::new(paths.clone()));
+    let updater = Arc::new(GitHubUpdater::new(paths.clone())?);
     let services = Arc::new(PuppyTermServices {
         paths: paths.clone(),
         secret_store,
         repository: Arc::clone(&repository),
         ssh_backend: Arc::clone(&backend),
+        updater: Arc::clone(&updater),
     });
 
     let system_index = scan_default_ssh_assets().unwrap_or(SystemProfileIndex {
@@ -130,6 +144,8 @@ fn load_boot_state() -> Result<BootState> {
         tunnels: repository.list_tunnels()?,
         recent_sessions: repository.recent_sessions()?,
         binary_status: backend.ssh_status(),
+        update_state: repository.load_update_state()?,
+        installed_build: updater.current_build(),
         system_index,
         startup_error: None,
     })

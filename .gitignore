@@ -2,3 +2,4 @@
 /build
 /.codex
 .DS_Store
+/update_signature_private_key.txt
