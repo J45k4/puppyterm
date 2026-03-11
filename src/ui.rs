@@ -5697,15 +5697,11 @@ fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
     let mut lines = if screen.is_empty() {
         vec![String::new()]
     } else {
-        screen.lines().map(ToOwned::to_owned).collect::<Vec<_>>()
+        screen.split('\n').map(ToOwned::to_owned).collect::<Vec<_>>()
     };
 
-    let row = usize::from(row);
+    let row = usize::from(row).min(lines.len().saturating_sub(1));
     let col = usize::from(col);
-
-    while lines.len() <= row {
-        lines.push(String::new());
-    }
 
     let line = &mut lines[row];
     let current_len = line.chars().count();
@@ -5721,6 +5717,25 @@ fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
     }
     *line = chars.into_iter().collect();
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_terminal_cursor;
+
+    #[test]
+    fn cursor_stays_on_last_visible_line_without_trailing_newline() {
+        let rendered = render_terminal_cursor("teppo@gabrensvenge:~$ ", 1, 23);
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.starts_with("teppo@gabrensvenge:~$ "));
+        assert!(rendered.ends_with('█'));
+    }
+
+    #[test]
+    fn cursor_can_render_on_trailing_blank_line_after_newline() {
+        let rendered = render_terminal_cursor("line 1\n", 1, 0);
+        assert_eq!(rendered, "line 1\n█");
+    }
 }
 
 fn terminal_text_offset_for_grid(screen: &str, point: TerminalGridPoint) -> Option<usize> {

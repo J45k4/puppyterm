@@ -16,6 +16,7 @@ use crate::{
     updater::{GitHubUpdater, InstalledBuild},
 };
 
+#[cfg(target_os = "macos")]
 const APP_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/puppyterm.png");
 
 #[derive(Clone)]

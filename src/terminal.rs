@@ -138,7 +138,7 @@ impl TerminalService {
             .with_context(|| format!("spawning {}", command.preview()))?;
         let killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
 
         let preview = command.preview();
         let snapshot = Arc::new(Mutex::new(SessionSnapshot {
@@ -156,8 +156,10 @@ impl TerminalService {
 
         let snapshot_for_reader = Arc::clone(&snapshot);
         let parser_for_reader = Arc::clone(&parser);
+        let writer_for_reader = Arc::clone(&writer);
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
+            let mut responder = TerminalResponder::default();
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
@@ -166,6 +168,10 @@ impl TerminalService {
                         let mut parser = parser_for_reader.lock();
                         let mut snapshot = snapshot_for_reader.lock();
                         apply_terminal_bytes(&mut snapshot, &mut parser, chunk);
+                        for response in responder.responses(&parser, chunk) {
+                            let _ = writer_for_reader.lock().write_all(response.as_bytes());
+                            let _ = writer_for_reader.lock().flush();
+                        }
                     }
                     Err(_) => break,
                 }
@@ -186,12 +192,80 @@ impl TerminalService {
 
         Ok(TerminalSessionHandle {
             snapshot,
-            writer: Arc::new(Mutex::new(writer)),
+            writer,
             master: Arc::new(Mutex::new(pair.master)),
             child,
             killer: Arc::new(Mutex::new(killer)),
             parser,
         })
+    }
+}
+
+#[derive(Default)]
+struct TerminalResponder {
+    pending: Vec<u8>,
+}
+
+impl TerminalResponder {
+    fn responses(&mut self, parser: &vt100::Parser, chunk: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(chunk);
+
+        let mut responses = Vec::new();
+        let mut cursor = 0;
+        while cursor < self.pending.len() {
+            let Some(offset) = self.pending[cursor..].iter().position(|byte| *byte == 0x1b) else {
+                break;
+            };
+            cursor += offset;
+
+            let Some((consumed, response)) = Self::parse_escape(parser, &self.pending[cursor..]) else {
+                break;
+            };
+            if let Some(response) = response {
+                responses.push(response);
+            }
+            cursor += consumed;
+        }
+
+        if cursor > 0 {
+            self.pending.drain(..cursor);
+        } else if self.pending.len() > 64 {
+            let split_at = self.pending.len().saturating_sub(64);
+            self.pending.drain(..split_at);
+        }
+
+        responses
+    }
+
+    fn parse_escape(parser: &vt100::Parser, bytes: &[u8]) -> Option<(usize, Option<String>)> {
+        if bytes.len() < 2 {
+            return None;
+        }
+        if bytes[0] != 0x1b {
+            return Some((1, None));
+        }
+        if bytes[1] != b'[' {
+            return Some((2, None));
+        }
+
+        let mut index = 2;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if (0x40..=0x7e).contains(&byte) {
+                let params = String::from_utf8_lossy(&bytes[2..index]);
+                let response = match (params.as_ref(), byte) {
+                    ("6", b'n') => {
+                        let (row, col) = parser.screen().cursor_position();
+                        Some(format!("\u{1b}[{};{}R", row + 1, col + 1))
+                    }
+                    _ => None,
+                };
+                return Some((index + 1, response));
+            }
+            index += 1;
+        }
+
+        None
     }
 }
 
@@ -217,7 +291,7 @@ fn sync_snapshot_from_parser(snapshot: &mut SessionSnapshot, parser: &vt100::Par
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionSnapshot, apply_terminal_bytes};
+    use super::{SessionSnapshot, TerminalResponder, apply_terminal_bytes};
 
     #[test]
     fn terminal_parser_tracks_screen_contents() {
@@ -238,5 +312,35 @@ mod tests {
         assert!(snapshot.raw_output.contains("hello"));
         assert!(snapshot.rendered_screen.contains("hello red"));
         assert!(!snapshot.hide_cursor);
+    }
+
+    #[test]
+    fn responder_answers_cursor_position_queries() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut snapshot = SessionSnapshot {
+            id: "1".into(),
+            title: "test".into(),
+            command_preview: "echo hi".into(),
+            raw_output: String::new(),
+            rendered_screen: String::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            hide_cursor: false,
+            exit_status: None,
+        };
+        apply_terminal_bytes(&mut snapshot, &mut parser, b"hello");
+
+        let mut responder = TerminalResponder::default();
+        let responses = responder.responses(&parser, b"\x1b[6n");
+        assert_eq!(responses, vec!["\x1b[1;6R".to_string()]);
+    }
+
+    #[test]
+    fn responder_handles_split_cursor_position_queries() {
+        let parser = vt100::Parser::new(24, 80, 0);
+        let mut responder = TerminalResponder::default();
+
+        assert!(responder.responses(&parser, b"\x1b[").is_empty());
+        assert_eq!(responder.responses(&parser, b"6n"), vec!["\x1b[1;1R".to_string()]);
     }
 }

@@ -400,7 +400,7 @@ fn detect_install_root(executable_path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn locate_staged_install(extracted_root: &Path, _build: &InstalledBuild) -> Result<PathBuf> {
+fn locate_staged_install(extracted_root: &Path, build: &InstalledBuild) -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let app_path = extracted_root.join("PuppyTerm.app");
