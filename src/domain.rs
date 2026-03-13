@@ -96,6 +96,8 @@ pub struct StoredKey {
     pub name: String,
     pub path: Option<PathBuf>,
     pub public_key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub inline_public_key: Option<String>,
     pub fingerprint: Option<String>,
     pub encrypted_blob_path: Option<PathBuf>,
     pub meta: RecordMeta,
@@ -113,6 +115,25 @@ impl StoredKey {
             name: name.into(),
             path: Some(path),
             public_key_path,
+            inline_public_key: None,
+            fingerprint: None,
+            encrypted_blob_path: None,
+            meta: RecordMeta::new(),
+        }
+    }
+
+    pub fn system_public(
+        name: impl Into<String>,
+        source_path: PathBuf,
+        public_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            source: ProfileSource::SystemDiscovered,
+            name: name.into(),
+            path: Some(source_path),
+            public_key_path: None,
+            inline_public_key: Some(public_key.into()),
             fingerprint: None,
             encrypted_blob_path: None,
             meta: RecordMeta::new(),

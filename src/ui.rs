@@ -964,6 +964,35 @@ impl PuppyTermView {
         cx.notify();
     }
 
+    fn open_profile_authorized_key_preview(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let title = format!("Authorized Key {}", profile.display_name);
+        if let Some((index, _)) = self.tabs.iter().enumerate().find(|(_, tab)| {
+            matches!(&tab.kind, WorkspaceTabKind::TextPreview { title: existing, .. } if existing == &title)
+        }) {
+            self.active_tab = index;
+            cx.notify();
+            return;
+        }
+
+        let body = profile_authorized_key_preview_body(&profile);
+        self.tabs.push(WorkspaceTab {
+            id: Uuid::new_v4().to_string(),
+            title: profile.display_name.clone(),
+            kind: WorkspaceTabKind::TextPreview { title, body },
+        });
+        self.active_tab = self.tabs.len().saturating_sub(1);
+        cx.notify();
+    }
+
     fn copy_identity_public_key(&mut self, key_id: &str, cx: &mut Context<Self>) {
         let key = self
             .system_index
@@ -987,6 +1016,36 @@ impl PuppyTermView {
 
         cx.write_to_clipboard(ClipboardItem::new_string(body));
         self.add_log(format!("Copied public key for {}.", key.name));
+        cx.notify();
+    }
+
+    fn copy_profile_authorized_key(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let body = profile_authorized_key_preview_body(&profile);
+        if body.starts_with("Could not read public key.")
+            || body == "This profile does not specify an IdentityFile in SSH config."
+        {
+            self.add_log(format!(
+                "Authorized key copy failed for {}.",
+                profile.display_name
+            ));
+            cx.notify();
+            return;
+        }
+
+        cx.write_to_clipboard(ClipboardItem::new_string(body));
+        self.add_log(format!(
+            "Copied authorized key for {}.",
+            profile.display_name
+        ));
         cx.notify();
     }
 
@@ -1526,6 +1585,7 @@ impl PuppyTermView {
                     path: Some(std::path::PathBuf::from(private_key_path)),
                     public_key_path: (!editor.public_key_path.trim().is_empty())
                         .then_some(std::path::PathBuf::from(editor.public_key_path.trim())),
+                    inline_public_key: None,
                     fingerprint: (!editor.fingerprint.trim().is_empty())
                         .then_some(editor.fingerprint.trim().to_string()),
                     encrypted_blob_path: None,
@@ -2679,20 +2739,7 @@ impl PuppyTermView {
                             .keys
                             .iter()
                             .chain(self.app_keys.iter())
-                            .map(|key| {
-                                let key_id = key.id.clone();
-                                div()
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(rgb(0x334155)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.open_identity_public_key_preview(&key_id, cx);
-                                        }),
-                                    )
-                                    .child(render_identity_row(key, cx))
-                                    .into_any_element()
-                            })
+                            .map(|key| render_identity_row(key, cx).into_any_element())
                             .collect::<Vec<_>>(),
                     ),
                 )
@@ -2964,7 +3011,11 @@ impl PuppyTermView {
             .child(section_body)
     }
 
-    fn render_profile_details(&self, profile: Option<&HostProfile>) -> impl IntoElement {
+    fn render_profile_details(
+        &self,
+        profile: Option<&HostProfile>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some(profile) = profile else {
             return div()
                 .id("empty-profile-pane")
@@ -3016,6 +3067,77 @@ impl PuppyTermView {
                     .clone()
                     .unwrap_or_else(|| "none".into())
             )))
+            .when(profile.identity_path.is_some(), |this| {
+                this.child(
+                    div()
+                        .mt_5()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(rgb(0x0f172a))
+                        .border_1()
+                        .border_color(rgb(0x1e293b))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::BOLD)
+                                .child("Authorized Key"),
+                        )
+                        .child(div().mt_2().text_sm().text_color(rgb(0x94a3b8)).child(
+                            "Preview or copy the public key line for this profile's IdentityFile.",
+                        ))
+                        .child(
+                            div()
+                                .mt_3()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "profile-authorized-key-preview-{}",
+                                            profile.id
+                                        )))
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x1d4ed8))
+                                        .hover(|this| this.bg(rgb(0x1e40af)))
+                                        .on_click(cx.listener({
+                                            let profile_id = profile.id.clone();
+                                            move |this, _, _, cx| {
+                                                this.open_profile_authorized_key_preview(
+                                                    &profile_id,
+                                                    cx,
+                                                );
+                                            }
+                                        }))
+                                        .child("Preview"),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "profile-authorized-key-copy-{}",
+                                            profile.id
+                                        )))
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(rgb(0x111827))
+                                        .border_1()
+                                        .border_color(rgb(0x334155))
+                                        .hover(|this| this.bg(rgb(0x1e293b)))
+                                        .on_click(cx.listener({
+                                            let profile_id = profile.id.clone();
+                                            move |this, _, _, cx| {
+                                                this.copy_profile_authorized_key(&profile_id, cx);
+                                            }
+                                        }))
+                                        .child("Copy"),
+                                ),
+                        ),
+                )
+            })
     }
 
     fn render_session_tab(
@@ -4914,6 +5036,7 @@ impl PuppyTermView {
                     self.all_profiles()
                         .into_iter()
                         .find(|profile| profile.id == profile_id),
+                    cx,
                 )
                 .into_any_element(),
             WorkspaceTabKind::SftpBrowser { profile_id } => self
@@ -5061,6 +5184,9 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
         ProfileSource::SystemDiscovered => "System",
         ProfileSource::AppManaged => "App",
     };
+    let authorized_key = identity_public_key_preview_body(key);
+    let authorized_key_available = !authorized_key.starts_with("Could not read public key.")
+        && authorized_key != "No public key file is associated with this identity.";
     let path_label = key
         .path
         .as_ref()
@@ -5107,6 +5233,29 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                         )
                         .child(
                             div()
+                                .id(SharedString::from(format!("identity-preview-{}", key.id)))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgb(0x0f172a))
+                                .border_1()
+                                .border_color(rgb(0x334155))
+                                .hover(|this| this.bg(rgb(0x1e293b)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let key_id = key.id.clone();
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.open_identity_public_key_preview(&key_id, cx);
+                                        }
+                                    }),
+                                )
+                                .child(div().text_xs().child("Preview")),
+                        )
+                        .child(
+                            div()
                                 .id(SharedString::from(format!("identity-copy-{}", key.id)))
                                 .px_2()
                                 .py_1()
@@ -5146,9 +5295,44 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                     .child(format!("Fingerprint: {fingerprint}")),
             )
         })
+        .child(
+            div()
+                .mt_3()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(0x0f172a))
+                .border_1()
+                .border_color(if authorized_key_available {
+                    rgb(0x1e293b)
+                } else {
+                    rgb(0x7f1d1d)
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child("Authorized key"),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .font_family(".SystemUIFontMonospaced")
+                        .text_xs()
+                        .text_color(if authorized_key_available {
+                            rgb(0xe2e8f0)
+                        } else {
+                            rgb(0xfca5a5)
+                        })
+                        .child(authorized_key.trim().to_string()),
+                ),
+        )
 }
 
 fn identity_public_key_preview_body(key: &StoredKey) -> String {
+    if let Some(inline_public_key) = key.inline_public_key.as_ref() {
+        return inline_public_key.clone();
+    }
+
     let public_key_path = key.public_key_path.clone().or_else(|| {
         key.path
             .as_ref()
@@ -5166,6 +5350,25 @@ fn identity_public_key_preview_body(key: &StoredKey) -> String {
         },
         None => "No public key file is associated with this identity.".into(),
     }
+}
+
+fn profile_authorized_key_preview_body(profile: &HostProfile) -> String {
+    let Some(identity_path) = profile.identity_path.as_ref() else {
+        return "This profile does not specify an IdentityFile in SSH config.".into();
+    };
+
+    let key = StoredKey {
+        id: profile.id.clone(),
+        source: profile.source,
+        name: profile.display_name.clone(),
+        path: Some(identity_path.clone()),
+        public_key_path: None,
+        inline_public_key: None,
+        fingerprint: None,
+        encrypted_blob_path: None,
+        meta: profile.meta.clone(),
+    };
+    identity_public_key_preview_body(&key)
 }
 
 fn render_tunnel_input(
@@ -5576,6 +5779,7 @@ fn generate_new_identity_key(
         name: key_name.to_string(),
         path: Some(private_key_path),
         public_key_path: Some(public_key_path),
+        inline_public_key: None,
         fingerprint,
         encrypted_blob_path: None,
         meta: crate::domain::RecordMeta::new(),
@@ -5697,7 +5901,10 @@ fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
     let mut lines = if screen.is_empty() {
         vec![String::new()]
     } else {
-        screen.split('\n').map(ToOwned::to_owned).collect::<Vec<_>>()
+        screen
+            .split('\n')
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
     };
 
     let row = usize::from(row).min(lines.len().saturating_sub(1));

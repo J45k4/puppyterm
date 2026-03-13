@@ -4190,6 +4190,7 @@ dependencies = [
  "dirs 6.0.0",
  "ed25519-dalek",
  "embed-resource",
+ "glob",
  "gpui",
  "image",
  "keyring",
