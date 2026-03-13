@@ -218,7 +218,8 @@ impl TerminalResponder {
             };
             cursor += offset;
 
-            let Some((consumed, response)) = Self::parse_escape(parser, &self.pending[cursor..]) else {
+            let Some((consumed, response)) = Self::parse_escape(parser, &self.pending[cursor..])
+            else {
                 break;
             };
             if let Some(response) = response {
@@ -341,6 +342,9 @@ mod tests {
         let mut responder = TerminalResponder::default();
 
         assert!(responder.responses(&parser, b"\x1b[").is_empty());
-        assert_eq!(responder.responses(&parser, b"6n"), vec!["\x1b[1;1R".to_string()]);
+        assert_eq!(
+            responder.responses(&parser, b"6n"),
+            vec!["\x1b[1;1R".to_string()]
+        );
     }
 }

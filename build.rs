@@ -8,7 +8,9 @@ use std::{
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn Error>> {
     use image::{
-        ExtendedColorType, ImageFormat, codecs::ico::{IcoEncoder, IcoFrame}, imageops::FilterType,
+        ExtendedColorType, ImageFormat,
+        codecs::ico::{IcoEncoder, IcoFrame},
+        imageops::FilterType,
     };
 
     println!("cargo:rerun-if-changed=assets/puppyterm.png");
@@ -16,7 +18,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let png_path = PathBuf::from("assets").join("puppyterm.png");
     let png_bytes = fs::read(&png_path)?;
-    let base_image = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)?.into_rgba8();
+    let base_image =
+        image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)?.into_rgba8();
 
     let mut frames = Vec::new();
     for size in [16_u32, 24, 32, 48, 64, 128, 256] {
