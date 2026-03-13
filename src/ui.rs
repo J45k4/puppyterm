@@ -216,13 +216,22 @@ enum IdentityFormField {
     Name,
     PrivateKeyPath,
     PublicKeyPath,
+    PrivateKeyText,
+    PublicKeyText,
     Fingerprint,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IdentityInputMode {
     Existing,
+    PasteKeyPair,
     CreateNew,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityPasteField {
+    Private,
+    Public,
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +243,8 @@ struct IdentityEditorState {
     name: String,
     private_key_path: String,
     public_key_path: String,
+    private_key_text: String,
+    public_key_text: String,
     fingerprint: String,
     focused_field: IdentityFormField,
     cursor_offset: usize,
@@ -410,6 +421,8 @@ impl PuppyTermView {
             name: String::new(),
             private_key_path: String::new(),
             public_key_path: String::new(),
+            private_key_text: String::new(),
+            public_key_text: String::new(),
             fingerprint: String::new(),
             focused_field: IdentityFormField::Name,
             cursor_offset: 0,
@@ -1117,6 +1130,20 @@ impl PuppyTermView {
         }
     }
 
+    fn focus_identity_text_field(
+        &mut self,
+        editor_id: &str,
+        field: IdentityFormField,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+            editor.focused_field = field;
+            editor.select_all = false;
+            editor.cursor_offset = identity_field_value(editor, field).chars().count();
+            cx.notify();
+        }
+    }
+
     fn choose_profile_identity(
         &mut self,
         editor_id: &str,
@@ -1517,6 +1544,34 @@ impl PuppyTermView {
             return true;
         }
 
+        let is_textarea_field = matches!(
+            editor.focused_field,
+            IdentityFormField::PrivateKeyText | IdentityFormField::PublicKeyText
+        );
+
+        if (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
+            && key == "v"
+            && is_textarea_field
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let replace_all = editor.select_all;
+                if replace_all {
+                    editor.select_all = false;
+                }
+                let mut cursor_offset = editor.cursor_offset;
+                let value = identity_field_value_mut(editor, editor.focused_field);
+                if replace_all {
+                    value.clear();
+                    cursor_offset = 0;
+                }
+                insert_text_at_cursor(value, &mut cursor_offset, &text);
+                editor.cursor_offset = cursor_offset;
+                editor.error = None;
+                cx.notify();
+                return true;
+            }
+        }
+
         match key.as_str() {
             "tab" => {
                 let fields = identity_editor_fields(editor.input_mode);
@@ -1593,6 +1648,22 @@ impl PuppyTermView {
                 cx.notify();
                 return true;
             }
+            "enter" if is_textarea_field => {
+                let replace_all = editor.select_all;
+                if replace_all {
+                    editor.select_all = false;
+                }
+                let mut cursor_offset = editor.cursor_offset;
+                let value = identity_field_value_mut(editor, editor.focused_field);
+                if replace_all {
+                    value.clear();
+                    cursor_offset = 0;
+                }
+                insert_text_at_cursor(value, &mut cursor_offset, "\n");
+                editor.cursor_offset = cursor_offset;
+                cx.notify();
+                return true;
+            }
             _ => {}
         }
 
@@ -1664,6 +1735,33 @@ impl PuppyTermView {
                     meta: crate::domain::RecordMeta::new(),
                 }
             }
+            (StorageMode::AppManaged, IdentityInputMode::PasteKeyPair) => {
+                if editor.private_key_text.trim().is_empty() {
+                    if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                        editor.error = Some("Paste a private key first.".into());
+                    }
+                    cx.notify();
+                    return;
+                }
+                let key_blobs = self.services.paths.key_blobs.clone();
+                match import_pasted_app_identity_key(
+                    &key_blobs,
+                    &editor.key_id,
+                    &name,
+                    editor.private_key_text.trim(),
+                    (!editor.public_key_text.trim().is_empty())
+                        .then_some(editor.public_key_text.trim()),
+                ) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                            editor.error = Some(error.to_string());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
             (StorageMode::AppManaged, IdentityInputMode::CreateNew) => {
                 let key_blobs = self.services.paths.key_blobs.clone();
                 match generate_new_app_identity_key(&key_blobs, &editor.key_id, &name) {
@@ -1692,6 +1790,30 @@ impl PuppyTermView {
                     (!editor.public_key_path.trim().is_empty())
                         .then_some(PathBuf::from(editor.public_key_path.trim()))
                         .as_deref(),
+                ) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                            editor.error = Some(error.to_string());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            (StorageMode::SystemSsh, IdentityInputMode::PasteKeyPair) => {
+                if editor.private_key_text.trim().is_empty() {
+                    if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                        editor.error = Some("Paste a private key first.".into());
+                    }
+                    cx.notify();
+                    return;
+                }
+                match import_pasted_system_identity_key(
+                    &name,
+                    editor.private_key_text.trim(),
+                    (!editor.public_key_text.trim().is_empty())
+                        .then_some(editor.public_key_text.trim()),
                 ) {
                     Ok(key) => key,
                     Err(error) => {
@@ -1807,6 +1929,46 @@ impl PuppyTermView {
             editor.focused_field = IdentityFormField::Name;
             editor.select_all = false;
             editor.cursor_offset = editor.name.chars().count();
+            cx.notify();
+        }
+    }
+
+    fn paste_identity_key_from_clipboard(
+        &mut self,
+        editor_id: &str,
+        field: IdentityPasteField,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                editor.error = Some("Clipboard does not contain text.".into());
+            }
+            cx.notify();
+            return;
+        };
+
+        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+            match field {
+                IdentityPasteField::Private => editor.private_key_text = text.to_string(),
+                IdentityPasteField::Public => editor.public_key_text = text.to_string(),
+            }
+            editor.error = None;
+            cx.notify();
+        }
+    }
+
+    fn clear_pasted_identity_key(
+        &mut self,
+        editor_id: &str,
+        field: IdentityPasteField,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+            match field {
+                IdentityPasteField::Private => editor.private_key_text.clear(),
+                IdentityPasteField::Public => editor.public_key_text.clear(),
+            }
+            editor.error = None;
             cx.notify();
         }
     }
@@ -3954,6 +4116,7 @@ impl PuppyTermView {
             .collect::<Vec<_>>();
         let mode_buttons = [
             (IdentityInputMode::Existing, "Use Existing"),
+            (IdentityInputMode::PasteKeyPair, "Paste Key Pair"),
             (IdentityInputMode::CreateNew, "Create New"),
         ]
         .into_iter()
@@ -4095,6 +4258,44 @@ impl PuppyTermView {
                             IdentityFormField::Fingerprint,
                             cx,
                         ))
+                    })
+                    .when(editor.input_mode == IdentityInputMode::PasteKeyPair, |this| {
+                        this.child(
+                            render_identity_paste_field(
+                                "Private Key",
+                                &editor.private_key_text,
+                                editor_id,
+                                IdentityFormField::PrivateKeyText,
+                                editor.focused_field == IdentityFormField::PrivateKeyText,
+                                editor.cursor_offset,
+                                IdentityPasteField::Private,
+                                cx,
+                            ),
+                        )
+                        .child(
+                            render_identity_paste_field(
+                                "Public Key",
+                                &editor.public_key_text,
+                                editor_id,
+                                IdentityFormField::PublicKeyText,
+                                editor.focused_field == IdentityFormField::PublicKeyText,
+                                editor.cursor_offset,
+                                IdentityPasteField::Public,
+                                cx,
+                            ),
+                        )
+                        .child(
+                            div()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x1e293b))
+                                .bg(rgb(0x0f172a))
+                                .p_3()
+                                .text_color(rgb(0xcbd5e1))
+                                .child(
+                                    "Paste from clipboard. If the public key is omitted, PuppyTerm derives it from the private key on save.",
+                                ),
+                        )
                     })
                     .when(editor.input_mode == IdentityInputMode::CreateNew, |this| {
                         this.child(
@@ -5931,6 +6132,123 @@ fn render_identity_path_input(
         )
 }
 
+fn render_identity_paste_field(
+    label: &str,
+    value: &str,
+    editor_id: &str,
+    form_field: IdentityFormField,
+    active: bool,
+    cursor_offset: usize,
+    field: IdentityPasteField,
+    cx: &mut Context<PuppyTermView>,
+) -> impl IntoElement {
+    let editor_id_for_paste = editor_id.to_string();
+    let editor_id_for_clear = editor_id.to_string();
+    let editor_id_for_focus = editor_id.to_string();
+    let label = label.to_string();
+    let status = if value.trim().is_empty() {
+        "Nothing pasted."
+    } else {
+        "Loaded from clipboard."
+    };
+
+    div()
+        .child(div().text_sm().text_color(rgb(0x94a3b8)).child(label))
+        .child(
+            div()
+                .mt_2()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "identity-paste-{}-{:?}",
+                            editor_id_for_paste, field
+                        )))
+                        .px_4()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(0x1e293b))
+                        .border_1()
+                        .border_color(rgb(0x334155))
+                        .hover(|this| this.bg(rgb(0x334155)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.paste_identity_key_from_clipboard(&editor_id_for_paste, field, cx);
+                        }))
+                        .child("Paste From Clipboard"),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "identity-paste-clear-{}-{:?}",
+                            editor_id_for_clear, field
+                        )))
+                        .px_4()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(0x0f172a))
+                        .border_1()
+                        .border_color(rgb(0x334155))
+                        .hover(|this| this.bg(rgb(0x1e293b)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.clear_pasted_identity_key(&editor_id_for_clear, field, cx);
+                        }))
+                        .child("Clear"),
+                ),
+        )
+        .child(
+            div()
+                .mt_2()
+                .rounded_md()
+                .cursor_pointer()
+                .border_1()
+                .border_color(if active { rgb(0x38bdf8) } else { rgb(0x334155) })
+                .bg(rgb(0x0f172a))
+                .p_3()
+                .hover(|this| this.bg(rgb(0x111827)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.focus_identity_text_field(&editor_id_for_focus, form_field, cx);
+                    }),
+                )
+                .child(div().text_xs().text_color(rgb(0x94a3b8)).child(status))
+                .child(
+                    div()
+                        .mt_2()
+                        .font_family(".SystemUIFontMonospaced")
+                        .text_xs()
+                        .text_color(rgb(0xcbd5e1))
+                        .child(if active {
+                            render_multiline_input_cursor(
+                                if value.is_empty() { "" } else { value },
+                                cursor_offset,
+                            )
+                            .into_any_element()
+                        } else {
+                            div()
+                                .child(if value.trim().is_empty() {
+                                    "<empty>".to_string()
+                                } else {
+                                    value.to_string()
+                                })
+                                .into_any_element()
+                        }),
+                )
+                .when(!value.trim().is_empty(), |this| {
+                    this.child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(rgb(0x94a3b8))
+                            .child(summarize_pasted_key(value)),
+                    )
+                }),
+        )
+}
+
 fn tunnel_field_value_mut(editor: &mut TunnelEditorState, field: TunnelFormField) -> &mut String {
     match field {
         TunnelFormField::Name => &mut editor.name,
@@ -5984,6 +6302,8 @@ fn identity_field_value_mut(
         IdentityFormField::Name => &mut editor.name,
         IdentityFormField::PrivateKeyPath => &mut editor.private_key_path,
         IdentityFormField::PublicKeyPath => &mut editor.public_key_path,
+        IdentityFormField::PrivateKeyText => &mut editor.private_key_text,
+        IdentityFormField::PublicKeyText => &mut editor.public_key_text,
         IdentityFormField::Fingerprint => &mut editor.fingerprint,
     }
 }
@@ -5993,6 +6313,8 @@ fn identity_field_value(editor: &IdentityEditorState, field: IdentityFormField) 
         IdentityFormField::Name => &editor.name,
         IdentityFormField::PrivateKeyPath => &editor.private_key_path,
         IdentityFormField::PublicKeyPath => &editor.public_key_path,
+        IdentityFormField::PrivateKeyText => &editor.private_key_text,
+        IdentityFormField::PublicKeyText => &editor.public_key_text,
         IdentityFormField::Fingerprint => &editor.fingerprint,
     }
 }
@@ -6004,6 +6326,11 @@ fn identity_editor_fields(mode: IdentityInputMode) -> &'static [IdentityFormFiel
             IdentityFormField::PrivateKeyPath,
             IdentityFormField::PublicKeyPath,
             IdentityFormField::Fingerprint,
+        ],
+        IdentityInputMode::PasteKeyPair => &[
+            IdentityFormField::Name,
+            IdentityFormField::PrivateKeyText,
+            IdentityFormField::PublicKeyText,
         ],
         IdentityInputMode::CreateNew => &[IdentityFormField::Name],
     }
@@ -6027,6 +6354,23 @@ fn sanitize_key_filename(name: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn summarize_pasted_key(value: &str) -> String {
+    let trimmed = value.trim();
+    let first_line = trimmed.lines().next().unwrap_or_default().trim();
+    if first_line.is_empty() {
+        return "<empty>".into();
+    }
+    if first_line.starts_with("-----BEGIN ") {
+        return format!("{} ({} lines)", first_line, trimmed.lines().count());
+    }
+    let clipped = if first_line.len() > 72 {
+        format!("{}...", &first_line[..72])
+    } else {
+        first_line.to_string()
+    };
+    format!("{} ({} lines)", clipped, trimmed.lines().count())
 }
 
 fn storage_mode_label(mode: StorageMode) -> &'static str {
@@ -6155,6 +6499,67 @@ fn public_key_for_private_key(
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
+fn write_private_key_file(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    let payload = if contents.ends_with('\n') {
+        contents.to_string()
+    } else {
+        format!("{contents}\n")
+    };
+    fs::write(path, payload)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn write_public_key_file(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    let payload = if contents.ends_with('\n') {
+        contents.to_string()
+    } else {
+        format!("{contents}\n")
+    };
+    fs::write(path, payload)?;
+    Ok(())
+}
+
+fn import_pasted_keypair(
+    key_name: &str,
+    private_key_path: PathBuf,
+    public_key_path: PathBuf,
+    private_key_text: &str,
+    public_key_text: Option<&str>,
+    source: ProfileSource,
+    id: String,
+) -> anyhow::Result<StoredKey> {
+    anyhow::ensure!(
+        !private_key_path.exists() && !public_key_path.exists(),
+        "Target identity files already exist at {}.",
+        private_key_path.display()
+    );
+
+    write_private_key_file(&private_key_path, private_key_text)?;
+    let public_key = match public_key_text {
+        Some(public_key_text) => public_key_text.trim().to_string(),
+        None => public_key_for_private_key(&private_key_path, None)?,
+    };
+    write_public_key_file(&public_key_path, &public_key)?;
+
+    let fingerprint = fingerprint_for_public_key(&public_key_path);
+    Ok(StoredKey {
+        id,
+        source,
+        name: key_name.to_string(),
+        path: Some(private_key_path),
+        public_key_path: Some(public_key_path),
+        inline_public_key: None,
+        fingerprint,
+        encrypted_blob_path: None,
+        meta: crate::domain::RecordMeta::new(),
+    })
+}
+
 fn install_system_identity_key(
     key_name: &str,
     private_key_path: &std::path::Path,
@@ -6185,6 +6590,47 @@ fn install_system_identity_key(
         encrypted_blob_path: None,
         meta: crate::domain::RecordMeta::new(),
     })
+}
+
+fn import_pasted_app_identity_key(
+    key_blobs: &std::path::Path,
+    key_id: &str,
+    key_name: &str,
+    private_key_text: &str,
+    public_key_text: Option<&str>,
+) -> anyhow::Result<StoredKey> {
+    let base_name = sanitize_key_filename(key_name);
+    let suffix_len = key_id.len().min(8);
+    let private_key_path = key_blobs.join(format!("{}_{}", base_name, &key_id[..suffix_len]));
+    let public_key_path = private_key_path.with_extension("pub");
+    import_pasted_keypair(
+        key_name,
+        private_key_path,
+        public_key_path,
+        private_key_text,
+        public_key_text,
+        ProfileSource::AppManaged,
+        key_id.to_string(),
+    )
+}
+
+fn import_pasted_system_identity_key(
+    key_name: &str,
+    private_key_text: &str,
+    public_key_text: Option<&str>,
+) -> anyhow::Result<StoredKey> {
+    let ssh_dir = system_ssh_dir()?;
+    let private_key_path = ssh_dir.join(sanitize_key_filename(key_name));
+    let public_key_path = private_key_path.with_extension("pub");
+    import_pasted_keypair(
+        &sanitize_key_filename(key_name),
+        private_key_path,
+        public_key_path,
+        private_key_text,
+        public_key_text,
+        ProfileSource::SystemDiscovered,
+        Uuid::new_v4().to_string(),
+    )
 }
 
 fn generate_new_app_identity_key(
@@ -6336,6 +6782,11 @@ fn render_inline_input_cursor(value: &str, cursor_offset: usize) -> impl IntoEle
         .when(!before.is_empty(), |this| this.child(before))
         .child(div().w(px(2.0)).h(px(22.0)).bg(rgb(0xe2e8f0)))
         .when(!after.is_empty(), |this| this.child(after))
+}
+
+fn render_multiline_input_cursor(value: &str, cursor_offset: usize) -> impl IntoElement {
+    let (before, after) = split_at_char_offset(value, cursor_offset);
+    div().child(format!("{before}█{after}"))
 }
 
 fn terminal_bytes_for_keystroke(event: &KeyDownEvent) -> Option<String> {
