@@ -139,6 +139,14 @@ impl StoredKey {
             meta: RecordMeta::new(),
         }
     }
+
+    pub fn is_authorized_key_entry(&self) -> bool {
+        self.inline_public_key.is_some()
+    }
+
+    pub fn can_use_for_identity_auth(&self) -> bool {
+        self.path.is_some() && !self.is_authorized_key_entry()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

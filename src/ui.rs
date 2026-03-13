@@ -3335,6 +3335,9 @@ impl PuppyTermView {
             .iter()
             .chain(self.app_keys.iter())
             .filter_map(|key| {
+                if !key.can_use_for_identity_auth() {
+                    return None;
+                }
                 let path = key.path.as_ref()?.display().to_string();
                 let active = editor.identity_path == path;
                 let editor_id = editor_id.to_string();
@@ -3527,7 +3530,7 @@ impl PuppyTermView {
                                     div()
                                         .text_sm()
                                         .text_color(rgb(0x94a3b8))
-                                        .child("Choose Identity"),
+                                    .child("Choose Private Key"),
                                 )
                                 .child(
                                     div()
@@ -3573,7 +3576,7 @@ impl PuppyTermView {
                                 .bg(rgb(0x0f172a))
                                 .p_3()
                                 .text_color(rgb(0x94a3b8))
-                                .child("No identities available. Create one in the Identities page first."),
+                                .child("No private-key identities available. authorized_keys entries are shown in Identities, but they cannot be used for outbound SSH auth."),
                         )
                     })
                     .when(use_password, |this| {
@@ -5184,6 +5187,11 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
         ProfileSource::SystemDiscovered => "System",
         ProfileSource::AppManaged => "App",
     };
+    let kind_label = if key.is_authorized_key_entry() {
+        "Authorized"
+    } else {
+        "Private"
+    };
     let authorized_key = identity_public_key_preview_body(key);
     let authorized_key_available = !authorized_key.starts_with("Could not read public key.")
         && authorized_key != "No public key file is associated with this identity.";
@@ -5230,6 +5238,19 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                                 })
                                 .text_xs()
                                 .child(source_label),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_full()
+                                .bg(if key.is_authorized_key_entry() {
+                                    rgb(0x7c2d12)
+                                } else {
+                                    rgb(0x1e3a8a)
+                                })
+                                .text_xs()
+                                .child(kind_label),
                         )
                         .child(
                             div()
