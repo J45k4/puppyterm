@@ -1,4 +1,4 @@
-use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use gpui::{
     App, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable, FontWeight, KeyDownEvent,
@@ -185,10 +185,17 @@ enum ProfileAuthMode {
     Password,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageMode {
+    AppManaged,
+    SystemSsh,
+}
+
 #[derive(Clone, Debug)]
 struct ProfileEditorState {
     editor_id: String,
     profile_id: String,
+    storage_mode: StorageMode,
     display_name: String,
     hostname: String,
     username: String,
@@ -222,6 +229,7 @@ enum IdentityInputMode {
 struct IdentityEditorState {
     editor_id: String,
     key_id: String,
+    storage_mode: StorageMode,
     input_mode: IdentityInputMode,
     name: String,
     private_key_path: String,
@@ -376,6 +384,7 @@ impl PuppyTermView {
         ProfileEditorState {
             editor_id: Uuid::new_v4().to_string(),
             profile_id: Uuid::new_v4().to_string(),
+            storage_mode: StorageMode::AppManaged,
             display_name: String::new(),
             hostname: String::new(),
             username: String::new(),
@@ -396,6 +405,7 @@ impl PuppyTermView {
         IdentityEditorState {
             editor_id: Uuid::new_v4().to_string(),
             key_id: Uuid::new_v4().to_string(),
+            storage_mode: StorageMode::AppManaged,
             input_mode: IdentityInputMode::Existing,
             name: String::new(),
             private_key_path: String::new(),
@@ -890,6 +900,7 @@ impl PuppyTermView {
         let editor = ProfileEditorState {
             editor_id: Uuid::new_v4().to_string(),
             profile_id: profile.id.clone(),
+            storage_mode: StorageMode::AppManaged,
             display_name: profile.display_name.clone(),
             hostname: profile.hostname.clone(),
             username: profile.username.clone().unwrap_or_default(),
@@ -1332,14 +1343,16 @@ impl PuppyTermView {
     }
 
     fn save_profile_editor(&mut self, editor_id: &str, cx: &mut Context<Self>) {
-        let Some(editor) = self.profile_editors.get_mut(editor_id) else {
+        let Some(editor) = self.profile_editors.get(editor_id).cloned() else {
             return;
         };
 
-        let display_name = editor.display_name.trim();
-        let hostname = editor.hostname.trim();
+        let display_name = editor.display_name.trim().to_string();
+        let hostname = editor.hostname.trim().to_string();
         if display_name.is_empty() || hostname.is_empty() {
-            editor.error = Some("Name and host are required.".into());
+            if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                editor.error = Some("Name and host are required.".into());
+            }
             cx.notify();
             return;
         }
@@ -1347,13 +1360,28 @@ impl PuppyTermView {
         let port = match editor.port.trim().parse::<u16>() {
             Ok(port) => port,
             Err(_) => {
-                editor.error = Some("Port must be a valid number.".into());
+                if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                    editor.error = Some("Port must be a valid number.".into());
+                }
                 cx.notify();
                 return;
             }
         };
 
-        let mut profile = HostProfile::new_app(display_name, hostname);
+        if editor.storage_mode == StorageMode::SystemSsh
+            && editor.auth_mode == ProfileAuthMode::Password
+        {
+            if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                editor.error = Some(
+                    "System SSH configs do not support saving passwords. Use an identity instead."
+                        .into(),
+                );
+            }
+            cx.notify();
+            return;
+        }
+
+        let mut profile = HostProfile::new_app(display_name.clone(), hostname.clone());
         profile.id = editor.profile_id.clone();
         profile.port = port;
         profile.username =
@@ -1363,19 +1391,22 @@ impl PuppyTermView {
         match editor.auth_mode {
             ProfileAuthMode::Identity => {
                 if editor.identity_path.trim().is_empty() {
-                    editor.error = Some("Choose an identity for identity-based auth.".into());
+                    if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                        editor.error = Some("Choose an identity for identity-based auth.".into());
+                    }
                     cx.notify();
                     return;
                 }
-                profile.identity_path = (!editor.identity_path.trim().is_empty())
-                    .then_some(std::path::PathBuf::from(editor.identity_path.trim()));
-                if let Some(secret_id) = editor.password_secret_id.clone() {
-                    if let Err(error) = self.services.secret_store.delete_secret(&secret_id) {
-                        editor.error = Some(format!("Could not clear saved password: {error}"));
+                profile.identity_path =
+                    Some(PathBuf::from(editor.identity_path.trim().to_string()));
+                if let Some(secret_id) = editor.password_secret_id.as_ref() {
+                    if let Err(error) = self.services.secret_store.delete_secret(secret_id) {
+                        if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                            editor.error = Some(format!("Could not clear saved password: {error}"));
+                        }
                         cx.notify();
                         return;
                     }
-                    editor.password_secret_id = None;
                 }
             }
             ProfileAuthMode::Password => {
@@ -1383,8 +1414,10 @@ impl PuppyTermView {
                 profile.identity_path = None;
                 if password.is_empty() {
                     let Some(secret_id) = editor.password_secret_id.clone() else {
-                        editor.error =
-                            Some("Password is required when password auth is selected.".into());
+                        if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                            editor.error =
+                                Some("Password is required when password auth is selected.".into());
+                        }
                         cx.notify();
                         return;
                     };
@@ -1396,36 +1429,71 @@ impl PuppyTermView {
                         .unwrap_or_else(|| format!("profile-password-{}", profile.id));
                     if let Err(error) = self.services.secret_store.put_secret(&secret_id, &password)
                     {
-                        editor.error = Some(format!("Could not save password: {error}"));
+                        if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                            editor.error = Some(format!("Could not save password: {error}"));
+                        }
                         cx.notify();
                         return;
                     }
-                    editor.password_secret_id = Some(secret_id.clone());
                     profile.auth_method = AuthMethod::Password { secret_id };
                 }
             }
         }
 
-        match self.services.repository.upsert_profile(&profile) {
-            Ok(()) => {
-                if let Some(existing) = self
-                    .app_profiles
-                    .iter_mut()
-                    .find(|item| item.id == profile.id)
-                {
-                    *existing = profile.clone();
-                } else {
-                    self.app_profiles.insert(0, profile.clone());
+        match editor.storage_mode {
+            StorageMode::AppManaged => match self.services.repository.upsert_profile(&profile) {
+                Ok(()) => {
+                    if let Some(existing) = self
+                        .app_profiles
+                        .iter_mut()
+                        .find(|item| item.id == profile.id)
+                    {
+                        *existing = profile.clone();
+                    } else {
+                        self.app_profiles.insert(0, profile.clone());
+                    }
+                    self.selected_profile_id = Some(profile.id.clone());
+                    if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                        editor.error = None;
+                        if editor.auth_mode == ProfileAuthMode::Identity {
+                            editor.password_secret_id = None;
+                        }
+                    }
+                    self.add_log(format!("Saved SSH profile {}.", profile.display_name));
+                    self.close_profile_editor_tab(editor_id, cx);
                 }
-                self.selected_profile_id = Some(profile.id.clone());
-                editor.error = None;
-                self.add_log(format!("Saved SSH profile {}.", profile.display_name));
-                self.close_profile_editor_tab(editor_id, cx);
-            }
-            Err(error) => {
-                editor.error = Some(error.to_string());
-                cx.notify();
-            }
+                Err(error) => {
+                    if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                        editor.error = Some(error.to_string());
+                    }
+                    cx.notify();
+                }
+            },
+            StorageMode::SystemSsh => match save_profile_to_system_ssh(
+                &display_name,
+                &hostname,
+                profile.username.as_deref(),
+                port,
+                profile.identity_path.as_deref(),
+                profile.ssh_options.proxy_jump.as_deref(),
+                profile.ssh_options.forward_agent,
+            ) {
+                Ok(include_path) => {
+                    self.refresh(cx);
+                    self.add_log(format!(
+                        "Saved system SSH config {} in {}.",
+                        display_name,
+                        include_path.display()
+                    ));
+                    self.close_profile_editor_tab(editor_id, cx);
+                }
+                Err(error) => {
+                    if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                        editor.error = Some(error.to_string());
+                    }
+                    cx.notify();
+                }
+            },
         }
     }
 
@@ -1559,32 +1627,36 @@ impl PuppyTermView {
     }
 
     fn save_identity_editor(&mut self, editor_id: &str, cx: &mut Context<Self>) {
-        let Some(editor) = self.identity_editors.get_mut(editor_id) else {
+        let Some(editor) = self.identity_editors.get(editor_id).cloned() else {
             return;
         };
 
-        let name = editor.name.trim();
+        let name = editor.name.trim().to_string();
         if name.is_empty() {
-            editor.error = Some("Name is required.".into());
+            if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                editor.error = Some("Name is required.".into());
+            }
             cx.notify();
             return;
         }
 
-        let key = match editor.input_mode {
-            IdentityInputMode::Existing => {
+        let key = match (editor.storage_mode, editor.input_mode) {
+            (StorageMode::AppManaged, IdentityInputMode::Existing) => {
                 let private_key_path = editor.private_key_path.trim();
                 if private_key_path.is_empty() {
-                    editor.error = Some("Private key path is required.".into());
+                    if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                        editor.error = Some("Private key path is required.".into());
+                    }
                     cx.notify();
                     return;
                 }
                 StoredKey {
                     id: editor.key_id.clone(),
                     source: ProfileSource::AppManaged,
-                    name: name.to_string(),
-                    path: Some(std::path::PathBuf::from(private_key_path)),
+                    name: name.clone(),
+                    path: Some(PathBuf::from(private_key_path)),
                     public_key_path: (!editor.public_key_path.trim().is_empty())
-                        .then_some(std::path::PathBuf::from(editor.public_key_path.trim())),
+                        .then_some(PathBuf::from(editor.public_key_path.trim())),
                     inline_public_key: None,
                     fingerprint: (!editor.fingerprint.trim().is_empty())
                         .then_some(editor.fingerprint.trim().to_string()),
@@ -1592,14 +1664,52 @@ impl PuppyTermView {
                     meta: crate::domain::RecordMeta::new(),
                 }
             }
-            IdentityInputMode::CreateNew => {
+            (StorageMode::AppManaged, IdentityInputMode::CreateNew) => {
                 let key_blobs = self.services.paths.key_blobs.clone();
-                let key_id = editor.key_id.clone();
-                let key_name = editor.name.trim().to_string();
-                match generate_new_identity_key(&key_blobs, &key_id, &key_name) {
+                match generate_new_app_identity_key(&key_blobs, &editor.key_id, &name) {
                     Ok(key) => key,
                     Err(error) => {
-                        editor.error = Some(error.to_string());
+                        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                            editor.error = Some(error.to_string());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            (StorageMode::SystemSsh, IdentityInputMode::Existing) => {
+                let private_key_path = editor.private_key_path.trim();
+                if private_key_path.is_empty() {
+                    if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                        editor.error = Some("Private key path is required.".into());
+                    }
+                    cx.notify();
+                    return;
+                }
+                match install_system_identity_key(
+                    &name,
+                    &PathBuf::from(private_key_path),
+                    (!editor.public_key_path.trim().is_empty())
+                        .then_some(PathBuf::from(editor.public_key_path.trim()))
+                        .as_deref(),
+                ) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                            editor.error = Some(error.to_string());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            (StorageMode::SystemSsh, IdentityInputMode::CreateNew) => {
+                match generate_new_system_identity_key(&name) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                            editor.error = Some(error.to_string());
+                        }
                         cx.notify();
                         return;
                     }
@@ -1607,17 +1717,64 @@ impl PuppyTermView {
             }
         };
 
-        match self.services.repository.upsert_key(&key) {
-            Ok(()) => {
-                self.app_keys.insert(0, key.clone());
-                editor.error = None;
-                self.add_log(format!("Saved identity {}.", key.name));
+        match editor.storage_mode {
+            StorageMode::AppManaged => match self.services.repository.upsert_key(&key) {
+                Ok(()) => {
+                    self.app_keys.insert(0, key.clone());
+                    if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                        editor.error = None;
+                    }
+                    self.add_log(format!("Saved identity {}.", key.name));
+                    self.close_identity_editor_tab(editor_id, cx);
+                }
+                Err(error) => {
+                    if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                        editor.error = Some(error.to_string());
+                    }
+                    cx.notify();
+                }
+            },
+            StorageMode::SystemSsh => {
+                self.refresh(cx);
+                if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                    editor.error = None;
+                }
+                self.add_log(format!("Saved system SSH identity {}.", key.name));
                 self.close_identity_editor_tab(editor_id, cx);
             }
-            Err(error) => {
-                editor.error = Some(error.to_string());
-                cx.notify();
+        }
+    }
+
+    fn set_profile_storage_mode(
+        &mut self,
+        editor_id: &str,
+        storage_mode: StorageMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+            editor.storage_mode = storage_mode;
+            editor.error = None;
+            if storage_mode == StorageMode::SystemSsh
+                && editor.auth_mode == ProfileAuthMode::Password
+            {
+                editor.auth_mode = ProfileAuthMode::Identity;
+                editor.password.clear();
+                editor.password_secret_id = None;
             }
+            cx.notify();
+        }
+    }
+
+    fn set_identity_storage_mode(
+        &mut self,
+        editor_id: &str,
+        storage_mode: StorageMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+            editor.storage_mode = storage_mode;
+            editor.error = None;
+            cx.notify();
         }
     }
 
@@ -3327,6 +3484,32 @@ impl PuppyTermView {
             .cloned()
             .expect("profile editor must exist");
         let focused = self.profile_editor_focus.is_focused(window);
+        let storage_buttons = [StorageMode::AppManaged, StorageMode::SystemSsh]
+            .into_iter()
+            .map(|mode| {
+                let active = editor.storage_mode == mode;
+                let editor_id = editor_id.to_string();
+                div()
+                    .id(SharedString::from(format!(
+                        "profile-storage-{}-{}",
+                        editor_id,
+                        storage_mode_label(mode)
+                    )))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active { rgb(0x1d4ed8) } else { rgb(0x1e293b) })
+                    .border_1()
+                    .border_color(if active { rgb(0x60a5fa) } else { rgb(0x334155) })
+                    .hover(|this| this.bg(rgb(0x334155)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_profile_storage_mode(&editor_id, mode, cx);
+                    }))
+                    .child(storage_mode_label(mode))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         let use_identity = editor.auth_mode == ProfileAuthMode::Identity;
         let use_password = editor.auth_mode == ProfileAuthMode::Password;
         let identity_buttons = self
@@ -3396,6 +3579,25 @@ impl PuppyTermView {
                     .child(
                         "Click a field, type to edit, use Tab to move, and Cmd/Ctrl+Enter to save.",
                     ),
+            )
+            .child(
+                div()
+                    .mt_6()
+                    .child(div().text_sm().text_color(rgb(0x94a3b8)).child("Storage"))
+                    .child(div().mt_2().flex().gap_2().children(storage_buttons))
+                    .when(editor.storage_mode == StorageMode::SystemSsh, |this| {
+                        this.child(
+                            div()
+                                .mt_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x334155))
+                                .bg(rgb(0x0f172a))
+                                .p_3()
+                                .text_color(rgb(0x94a3b8))
+                                .child("System SSH writes a managed Host block into ~/.ssh/puppyterm.conf and ensures ~/.ssh/config includes it. The Name field becomes the SSH alias, so avoid spaces and wildcards."),
+                        )
+                    }),
             )
             .when_some(editor.error.as_ref(), |this, error| {
                 this.child(
@@ -3499,30 +3701,51 @@ impl PuppyTermView {
                                             }))
                                             .child("Use Identity"),
                                     )
-                                    .child(
-                                        div()
-                                            .px_3()
-                                            .py_2()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .bg(if use_password { rgb(0x1d4ed8) } else { rgb(0x1e293b) })
-                                            .border_1()
-                                            .border_color(if use_password { rgb(0x60a5fa) } else { rgb(0x334155) })
-                                            .hover(|this| this.bg(rgb(0x334155)))
-                                            .on_mouse_down(MouseButton::Left, cx.listener({
-                                                let editor_id = editor_id.to_string();
-                                                move |this, _, _, cx| {
-                                                    this.select_profile_auth_mode(
-                                                        &editor_id,
-                                                        ProfileAuthMode::Password,
-                                                        cx,
-                                                    );
-                                                }
-                                            }))
-                                            .child("Use Password"),
-                                    ),
+                                    .when(editor.storage_mode == StorageMode::AppManaged, |this| {
+                                        this.child(
+                                            div()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(if use_password {
+                                                    rgb(0x1d4ed8)
+                                                } else {
+                                                    rgb(0x1e293b)
+                                                })
+                                                .border_1()
+                                                .border_color(if use_password {
+                                                    rgb(0x60a5fa)
+                                                } else {
+                                                    rgb(0x334155)
+                                                })
+                                                .hover(|this| this.bg(rgb(0x334155)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener({
+                                                        let editor_id = editor_id.to_string();
+                                                        move |this, _, _, cx| {
+                                                            this.select_profile_auth_mode(
+                                                                &editor_id,
+                                                                ProfileAuthMode::Password,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    }),
+                                                )
+                                                .child("Use Password"),
+                                        )
+                                    }),
                             ),
                     )
+                    .when(editor.storage_mode == StorageMode::SystemSsh, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x94a3b8))
+                                .child("System SSH profiles use identity or agent-based auth only."),
+                        )
+                    })
                     .when(use_identity && has_identity_buttons, |this| {
                         this.child(
                             div()
@@ -3703,6 +3926,32 @@ impl PuppyTermView {
             .cloned()
             .expect("identity editor must exist");
         let focused = self.identity_editor_focus.is_focused(window);
+        let storage_buttons = [StorageMode::AppManaged, StorageMode::SystemSsh]
+            .into_iter()
+            .map(|mode| {
+                let active = editor.storage_mode == mode;
+                let editor_id = editor_id.to_string();
+                div()
+                    .id(SharedString::from(format!(
+                        "identity-storage-{}-{}",
+                        editor_id,
+                        storage_mode_label(mode)
+                    )))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if active { rgb(0x1d4ed8) } else { rgb(0x1e293b) })
+                    .border_1()
+                    .border_color(if active { rgb(0x60a5fa) } else { rgb(0x334155) })
+                    .hover(|this| this.bg(rgb(0x334155)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_identity_storage_mode(&editor_id, mode, cx);
+                    }))
+                    .child(storage_mode_label(mode))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         let mode_buttons = [
             (IdentityInputMode::Existing, "Use Existing"),
             (IdentityInputMode::CreateNew, "Create New"),
@@ -3762,6 +4011,25 @@ impl PuppyTermView {
                     .child(
                         "Click a field, type to edit, use Tab to move, and Cmd/Ctrl+Enter to save.",
                     ),
+            )
+            .child(
+                div()
+                    .mt_6()
+                    .child(div().text_sm().text_color(rgb(0x94a3b8)).child("Storage"))
+                    .child(div().mt_2().flex().gap_2().children(storage_buttons))
+                    .when(editor.storage_mode == StorageMode::SystemSsh, |this| {
+                        this.child(
+                            div()
+                                .mt_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x334155))
+                                .bg(rgb(0x0f172a))
+                                .p_3()
+                                .text_color(rgb(0x94a3b8))
+                                .child("System SSH stores keys in ~/.ssh. Existing keys are copied there and newly generated keys are created there."),
+                        )
+                    }),
             )
             .child(div().mt_6().flex().gap_2().children(mode_buttons))
             .when_some(editor.error.as_ref(), |this, error| {
@@ -3837,9 +4105,11 @@ impl PuppyTermView {
                                 .bg(rgb(0x0f172a))
                                 .p_3()
                                 .text_color(rgb(0xcbd5e1))
-                                .child(
-                                    "Save will generate a new Ed25519 keypair in PuppyTerm storage.",
-                                ),
+                                .child(if editor.storage_mode == StorageMode::SystemSsh {
+                                    "Save will generate a new Ed25519 keypair in ~/.ssh."
+                                } else {
+                                    "Save will generate a new Ed25519 keypair in PuppyTerm storage."
+                                }),
                         )
                     })
                     .child(
@@ -5759,7 +6029,165 @@ fn sanitize_key_filename(name: &str) -> String {
     }
 }
 
-fn generate_new_identity_key(
+fn storage_mode_label(mode: StorageMode) -> &'static str {
+    match mode {
+        StorageMode::AppManaged => "App-managed",
+        StorageMode::SystemSsh => "System SSH",
+    }
+}
+
+fn system_ssh_dir() -> anyhow::Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not locate home directory"))?;
+    let ssh_dir = home.join(".ssh");
+    fs::create_dir_all(&ssh_dir)?;
+    Ok(ssh_dir)
+}
+
+fn ensure_puppyterm_system_include() -> anyhow::Result<PathBuf> {
+    let ssh_dir = system_ssh_dir()?;
+    let config_path = ssh_dir.join("config");
+    let include_path = ssh_dir.join("puppyterm.conf");
+    let include_line = format!("Include {}", include_path.display());
+    let mut config_contents = fs::read_to_string(&config_path).unwrap_or_default();
+    if !config_contents
+        .lines()
+        .any(|line| line.trim() == include_line.as_str())
+    {
+        if !config_contents.is_empty() && !config_contents.ends_with('\n') {
+            config_contents.push('\n');
+        }
+        config_contents.push_str(&include_line);
+        config_contents.push('\n');
+        fs::write(&config_path, config_contents)?;
+    }
+    if !include_path.exists() {
+        fs::write(&include_path, "")?;
+    }
+    Ok(include_path)
+}
+
+fn validate_system_host_alias(alias: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !alias.is_empty(),
+        "Name is required for a system SSH host entry."
+    );
+    anyhow::ensure!(
+        alias
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
+        "System SSH host names may only use letters, numbers, '-', '_' and '.'."
+    );
+    Ok(())
+}
+
+fn save_profile_to_system_ssh(
+    alias: &str,
+    hostname: &str,
+    username: Option<&str>,
+    port: u16,
+    identity_path: Option<&std::path::Path>,
+    proxy_jump: Option<&str>,
+    forward_agent: bool,
+) -> anyhow::Result<PathBuf> {
+    validate_system_host_alias(alias)?;
+    let include_path = ensure_puppyterm_system_include()?;
+    let identity_path =
+        identity_path.ok_or_else(|| anyhow::anyhow!("System SSH configs require an identity."))?;
+    let existing = fs::read_to_string(&include_path).unwrap_or_default();
+    anyhow::ensure!(
+        !existing
+            .lines()
+            .any(|line| line.trim() == format!("Host {alias}")),
+        "A system SSH host entry named '{alias}' already exists in {}.",
+        include_path.display()
+    );
+
+    let mut block = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        block.push('\n');
+    }
+    block.push_str(&format!("# PuppyTerm managed entry for {alias}\n"));
+    block.push_str(&format!("Host {alias}\n"));
+    block.push_str(&format!("  HostName {hostname}\n"));
+    if let Some(username) = username.filter(|value| !value.trim().is_empty()) {
+        block.push_str(&format!("  User {username}\n"));
+    }
+    block.push_str(&format!("  Port {port}\n"));
+    block.push_str(&format!("  IdentityFile {}\n", identity_path.display()));
+    if let Some(proxy_jump) = proxy_jump.filter(|value| !value.trim().is_empty()) {
+        block.push_str(&format!("  ProxyJump {proxy_jump}\n"));
+    }
+    if forward_agent {
+        block.push_str("  ForwardAgent yes\n");
+    }
+
+    let mut contents = existing;
+    contents.push_str(&block);
+    fs::write(&include_path, contents)?;
+    Ok(include_path)
+}
+
+fn public_key_for_private_key(
+    private_key_path: &std::path::Path,
+    public_key_path: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
+    if let Some(public_key_path) = public_key_path {
+        return Ok(fs::read_to_string(public_key_path)?.trim().to_string());
+    }
+
+    let output = Command::new("ssh-keygen")
+        .arg("-y")
+        .arg("-f")
+        .arg(private_key_path)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "ssh-keygen failed{}",
+            if stderr.is_empty() {
+                ".".to_string()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+fn install_system_identity_key(
+    key_name: &str,
+    private_key_path: &std::path::Path,
+    public_key_path: Option<&std::path::Path>,
+) -> anyhow::Result<StoredKey> {
+    let ssh_dir = system_ssh_dir()?;
+    let private_target = ssh_dir.join(sanitize_key_filename(key_name));
+    let public_target = private_target.with_extension("pub");
+    anyhow::ensure!(
+        !private_target.exists() && !public_target.exists(),
+        "Target identity files already exist at {}.",
+        private_target.display()
+    );
+
+    fs::copy(private_key_path, &private_target)?;
+    let public_key = public_key_for_private_key(private_key_path, public_key_path)?;
+    fs::write(&public_target, format!("{public_key}\n"))?;
+
+    let fingerprint = fingerprint_for_public_key(&public_target);
+    Ok(StoredKey {
+        id: Uuid::new_v4().to_string(),
+        source: ProfileSource::SystemDiscovered,
+        name: sanitize_key_filename(key_name),
+        path: Some(private_target),
+        public_key_path: Some(public_target),
+        inline_public_key: None,
+        fingerprint,
+        encrypted_blob_path: None,
+        meta: crate::domain::RecordMeta::new(),
+    })
+}
+
+fn generate_new_app_identity_key(
     key_blobs: &std::path::Path,
     key_id: &str,
     key_name: &str,
@@ -5798,6 +6226,53 @@ fn generate_new_identity_key(
         id: key_id.to_string(),
         source: ProfileSource::AppManaged,
         name: key_name.to_string(),
+        path: Some(private_key_path),
+        public_key_path: Some(public_key_path),
+        inline_public_key: None,
+        fingerprint,
+        encrypted_blob_path: None,
+        meta: crate::domain::RecordMeta::new(),
+    })
+}
+
+fn generate_new_system_identity_key(key_name: &str) -> anyhow::Result<StoredKey> {
+    let ssh_dir = system_ssh_dir()?;
+    let private_key_path = ssh_dir.join(sanitize_key_filename(key_name));
+    let public_key_path = private_key_path.with_extension("pub");
+    anyhow::ensure!(
+        !private_key_path.exists() && !public_key_path.exists(),
+        "Target identity files already exist at {}.",
+        private_key_path.display()
+    );
+
+    let output = Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-C")
+        .arg(key_name)
+        .arg("-f")
+        .arg(&private_key_path)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "ssh-keygen failed{}",
+            if stderr.is_empty() {
+                ".".to_string()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+
+    let fingerprint = fingerprint_for_public_key(&public_key_path);
+    Ok(StoredKey {
+        id: Uuid::new_v4().to_string(),
+        source: ProfileSource::SystemDiscovered,
+        name: sanitize_key_filename(key_name),
         path: Some(private_key_path),
         public_key_path: Some(public_key_path),
         inline_public_key: None,
