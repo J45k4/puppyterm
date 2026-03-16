@@ -16,6 +16,7 @@ pub trait ProfileRepository: Send + Sync {
     fn duplicate_system_profile(&self, profile: &HostProfile) -> Result<HostProfile>;
     fn list_keys(&self) -> Result<Vec<StoredKey>>;
     fn upsert_key(&self, key: &StoredKey) -> Result<()>;
+    fn delete_key(&self, key_id: &str) -> Result<()>;
     fn list_tunnels(&self) -> Result<Vec<TunnelSpec>>;
     fn upsert_tunnel(&self, tunnel: &TunnelSpec) -> Result<()>;
     fn delete_tunnel(&self, tunnel_id: &str) -> Result<()>;
@@ -158,6 +159,13 @@ impl ProfileRepository for SqliteProfileRepository {
 
     fn upsert_key(&self, key: &StoredKey) -> Result<()> {
         self.upsert_json("keys", &key.id, "source", "name", "updated_at", key)
+    }
+
+    fn delete_key(&self, key_id: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .execute("DELETE FROM keys WHERE id = ?1", params![key_id])?;
+        Ok(())
     }
 
     fn list_tunnels(&self) -> Result<Vec<TunnelSpec>> {

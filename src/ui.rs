@@ -215,6 +215,7 @@ struct ProfileEditorState {
 enum IdentityFormField {
     Name,
     PrivateKeyPath,
+    PrivateKeyPassphrase,
     PublicKeyPath,
     PrivateKeyText,
     PublicKeyText,
@@ -238,10 +239,12 @@ enum IdentityPasteField {
 struct IdentityEditorState {
     editor_id: String,
     key_id: String,
+    existing_key_id: Option<String>,
     storage_mode: StorageMode,
     input_mode: IdentityInputMode,
     name: String,
     private_key_path: String,
+    private_key_passphrase: String,
     public_key_path: String,
     private_key_text: String,
     public_key_text: String,
@@ -416,10 +419,12 @@ impl PuppyTermView {
         IdentityEditorState {
             editor_id: Uuid::new_v4().to_string(),
             key_id: Uuid::new_v4().to_string(),
+            existing_key_id: None,
             storage_mode: StorageMode::AppManaged,
             input_mode: IdentityInputMode::Existing,
             name: String::new(),
             private_key_path: String::new(),
+            private_key_passphrase: String::new(),
             public_key_path: String::new(),
             private_key_text: String::new(),
             public_key_text: String::new(),
@@ -957,6 +962,49 @@ impl PuppyTermView {
         cx.notify();
     }
 
+    fn edit_identity(&mut self, key_id: &str, cx: &mut Context<Self>) {
+        let Some(key) = self.app_keys.iter().find(|key| key.id == key_id).cloned() else {
+            return;
+        };
+
+        let name = key.name.clone();
+        let editor = IdentityEditorState {
+            editor_id: Uuid::new_v4().to_string(),
+            key_id: key.id.clone(),
+            existing_key_id: Some(key.id.clone()),
+            storage_mode: StorageMode::AppManaged,
+            input_mode: IdentityInputMode::Existing,
+            name: key.name.clone(),
+            private_key_path: key
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            private_key_passphrase: String::new(),
+            public_key_path: key
+                .public_key_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            private_key_text: String::new(),
+            public_key_text: String::new(),
+            fingerprint: key.fingerprint.unwrap_or_default(),
+            focused_field: IdentityFormField::Name,
+            cursor_offset: key.name.chars().count(),
+            select_all: false,
+            error: None,
+        };
+        let editor_id = editor.editor_id.clone();
+        self.identity_editors.insert(editor_id.clone(), editor);
+        self.tabs.push(WorkspaceTab {
+            id: Uuid::new_v4().to_string(),
+            title: format!("Edit {name}"),
+            kind: WorkspaceTabKind::IdentityEditor { editor_id },
+        });
+        self.active_tab = self.tabs.len().saturating_sub(1);
+        cx.notify();
+    }
+
     fn open_identity_public_key_preview(&mut self, key_id: &str, cx: &mut Context<Self>) {
         let key = self
             .system_index
@@ -1159,6 +1207,38 @@ impl PuppyTermView {
             editor.error = None;
             cx.notify();
         }
+    }
+
+    fn pick_profile_identity_file(&mut self, editor_id: &str, cx: &mut Context<Self>) {
+        let editor_id = editor_id.to_string();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select private key".into()),
+        });
+        cx.spawn(async move |this_entity, cx| {
+            let Ok(result) = receiver.await else {
+                return;
+            };
+            let Ok(selection) = result else {
+                let _ = this_entity.update(cx, |this, cx| {
+                    if let Some(editor) = this.profile_editors.get_mut(editor_id.as_str()) {
+                        editor.error = Some("Could not open file picker.".into());
+                        cx.notify();
+                    }
+                });
+                return;
+            };
+            let Some(path) = selection.and_then(|mut paths| paths.drain(..).next()) else {
+                return;
+            };
+            let path_text = path.to_string_lossy().to_string();
+            let _ = this_entity.update(cx, |this, cx| {
+                this.choose_profile_identity(&editor_id, Some(path_text), cx);
+            });
+        })
+        .detach();
     }
 
     fn select_profile_auth_mode(
@@ -1424,8 +1504,29 @@ impl PuppyTermView {
                     cx.notify();
                     return;
                 }
-                profile.identity_path =
-                    Some(PathBuf::from(editor.identity_path.trim().to_string()));
+                let selected_identity_path = PathBuf::from(editor.identity_path.trim());
+                let resolved_identity_path = match editor.storage_mode {
+                    StorageMode::AppManaged => prepare_app_profile_identity_path(
+                        &self.services.paths.key_blobs,
+                        &profile.id,
+                        &display_name,
+                        &selected_identity_path,
+                    ),
+                    StorageMode::SystemSsh => prepare_system_profile_identity_path(
+                        &display_name,
+                        &selected_identity_path,
+                    ),
+                };
+                profile.identity_path = Some(match resolved_identity_path {
+                    Ok(path) => path,
+                    Err(error) => {
+                        if let Some(editor) = self.profile_editors.get_mut(editor_id) {
+                            editor.error = Some(error.to_string());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                });
                 if let Some(secret_id) = editor.password_secret_id.as_ref() {
                     if let Err(error) = self.services.secret_store.delete_secret(secret_id) {
                         if let Some(editor) = self.profile_editors.get_mut(editor_id) {
@@ -1701,6 +1802,10 @@ impl PuppyTermView {
         let Some(editor) = self.identity_editors.get(editor_id).cloned() else {
             return;
         };
+        let previous_key = editor
+            .existing_key_id
+            .as_ref()
+            .and_then(|key_id| self.app_keys.iter().find(|key| &key.id == key_id).cloned());
 
         let name = editor.name.trim().to_string();
         if name.is_empty() {
@@ -1711,7 +1816,7 @@ impl PuppyTermView {
             return;
         }
 
-        let key = match (editor.storage_mode, editor.input_mode) {
+        let mut key = match (editor.storage_mode, editor.input_mode) {
             (StorageMode::AppManaged, IdentityInputMode::Existing) => {
                 let private_key_path = editor.private_key_path.trim();
                 if private_key_path.is_empty() {
@@ -1721,18 +1826,27 @@ impl PuppyTermView {
                     cx.notify();
                     return;
                 }
-                StoredKey {
-                    id: editor.key_id.clone(),
-                    source: ProfileSource::AppManaged,
-                    name: name.clone(),
-                    path: Some(PathBuf::from(private_key_path)),
-                    public_key_path: (!editor.public_key_path.trim().is_empty())
-                        .then_some(PathBuf::from(editor.public_key_path.trim())),
-                    inline_public_key: None,
-                    fingerprint: (!editor.fingerprint.trim().is_empty())
-                        .then_some(editor.fingerprint.trim().to_string()),
-                    encrypted_blob_path: None,
-                    meta: crate::domain::RecordMeta::new(),
+                match import_existing_app_identity_key(
+                    &self.services.paths.key_blobs,
+                    &editor.key_id,
+                    &name,
+                    &PathBuf::from(private_key_path),
+                    (!editor.public_key_path.trim().is_empty())
+                        .then_some(PathBuf::from(editor.public_key_path.trim()))
+                        .as_deref(),
+                    (!editor.fingerprint.trim().is_empty()).then_some(editor.fingerprint.trim()),
+                    previous_key.is_some(),
+                    (!editor.private_key_passphrase.trim().is_empty())
+                        .then_some(editor.private_key_passphrase.trim()),
+                ) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        if let Some(editor) = self.identity_editors.get_mut(editor_id) {
+                            editor.error = Some(error.to_string());
+                        }
+                        cx.notify();
+                        return;
+                    }
                 }
             }
             (StorageMode::AppManaged, IdentityInputMode::PasteKeyPair) => {
@@ -1751,6 +1865,9 @@ impl PuppyTermView {
                     editor.private_key_text.trim(),
                     (!editor.public_key_text.trim().is_empty())
                         .then_some(editor.public_key_text.trim()),
+                    previous_key.is_some(),
+                    (!editor.private_key_passphrase.trim().is_empty())
+                        .then_some(editor.private_key_passphrase.trim()),
                 ) {
                     Ok(key) => key,
                     Err(error) => {
@@ -1764,7 +1881,12 @@ impl PuppyTermView {
             }
             (StorageMode::AppManaged, IdentityInputMode::CreateNew) => {
                 let key_blobs = self.services.paths.key_blobs.clone();
-                match generate_new_app_identity_key(&key_blobs, &editor.key_id, &name) {
+                match generate_new_app_identity_key(
+                    &key_blobs,
+                    &editor.key_id,
+                    &name,
+                    previous_key.is_some(),
+                ) {
                     Ok(key) => key,
                     Err(error) => {
                         if let Some(editor) = self.identity_editors.get_mut(editor_id) {
@@ -1790,6 +1912,8 @@ impl PuppyTermView {
                     (!editor.public_key_path.trim().is_empty())
                         .then_some(PathBuf::from(editor.public_key_path.trim()))
                         .as_deref(),
+                    (!editor.private_key_passphrase.trim().is_empty())
+                        .then_some(editor.private_key_passphrase.trim()),
                 ) {
                     Ok(key) => key,
                     Err(error) => {
@@ -1814,6 +1938,8 @@ impl PuppyTermView {
                     editor.private_key_text.trim(),
                     (!editor.public_key_text.trim().is_empty())
                         .then_some(editor.public_key_text.trim()),
+                    (!editor.private_key_passphrase.trim().is_empty())
+                        .then_some(editor.private_key_passphrase.trim()),
                 ) {
                     Ok(key) => key,
                     Err(error) => {
@@ -1839,9 +1965,18 @@ impl PuppyTermView {
             }
         };
 
+        if let Some(previous_key) = previous_key.as_ref() {
+            key.meta = previous_key.meta.clone();
+            key.meta.touch();
+        }
+
         match editor.storage_mode {
             StorageMode::AppManaged => match self.services.repository.upsert_key(&key) {
                 Ok(()) => {
+                    if let Some(previous_key) = previous_key.as_ref() {
+                        self.cleanup_app_identity_artifacts(previous_key, Some(&key));
+                    }
+                    self.app_keys.retain(|existing| existing.id != key.id);
                     self.app_keys.insert(0, key.clone());
                     if let Some(editor) = self.identity_editors.get_mut(editor_id) {
                         editor.error = None;
@@ -1863,6 +1998,52 @@ impl PuppyTermView {
                 }
                 self.add_log(format!("Saved system SSH identity {}.", key.name));
                 self.close_identity_editor_tab(editor_id, cx);
+            }
+        }
+    }
+
+    fn delete_identity(&mut self, key_id: &str, cx: &mut Context<Self>) {
+        if let Some(key) = self.app_keys.iter().find(|key| key.id == key_id).cloned() {
+            match self.services.repository.delete_key(key_id) {
+                Ok(()) => {
+                    self.cleanup_app_identity_artifacts(&key, None);
+                    self.app_keys.retain(|existing| existing.id != key_id);
+                    self.close_identity_editors_for_key(key_id, cx);
+                    self.add_log(format!("Deleted identity {}.", key.name));
+                    cx.notify();
+                }
+                Err(error) => {
+                    self.add_log(format!("Identity deletion failed for {}: {error}", key.name));
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
+        let Some(key) = self
+            .system_index
+            .keys
+            .iter()
+            .find(|key| key.id == key_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let result = if key.is_authorized_key_entry() {
+            delete_authorized_key_entry(&key)
+        } else {
+            delete_system_identity_files(&key)
+        };
+
+        match result {
+            Ok(()) => {
+                self.add_log(format!("Deleted identity {}.", key.name));
+                self.refresh(cx);
+            }
+            Err(error) => {
+                self.add_log(format!("Identity deletion failed for {}: {error}", key.name));
+                cx.notify();
             }
         }
     }
@@ -2033,6 +2214,33 @@ impl PuppyTermView {
                 self.active_tab = self.tabs.len().saturating_sub(1);
             }
             cx.notify();
+        }
+    }
+
+    fn close_identity_editors_for_key(&mut self, key_id: &str, cx: &mut Context<Self>) {
+        let editor_ids = self
+            .identity_editors
+            .iter()
+            .filter_map(|(editor_id, editor)| {
+                (editor.key_id == key_id || editor.existing_key_id.as_deref() == Some(key_id))
+                    .then_some(editor_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for editor_id in editor_ids {
+            self.close_identity_editor_tab(&editor_id, cx);
+        }
+    }
+
+    fn cleanup_app_identity_artifacts(&self, key: &StoredKey, replacement: Option<&StoredKey>) {
+        let protected_paths = replacement
+            .map(identity_artifact_paths)
+            .unwrap_or_default();
+
+        for path in identity_artifact_paths(key) {
+            if !path.starts_with(&self.services.paths.key_blobs) || protected_paths.contains(&path) {
+                continue;
+            }
+            let _ = fs::remove_file(path);
         }
     }
 
@@ -3952,6 +4160,26 @@ impl PuppyTermView {
                                 ),
                         )
                     })
+                    .when(use_identity, |this| {
+                        this.child(render_profile_path_input(
+                            "Identity File",
+                            &editor.identity_path,
+                            editor.focused_field == ProfileFormField::IdentityPath,
+                            editor.select_all
+                                && editor.focused_field == ProfileFormField::IdentityPath,
+                            editor.cursor_offset,
+                            editor_id,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x94a3b8))
+                                .child(
+                                    "Pick an imported identity above or browse directly to an SSH private key file. PuTTY .ppk keys are converted on save, and encrypted ones use the PuTTY passphrase field.",
+                                ),
+                        )
+                    })
                     .when(use_identity && !has_identity_buttons, |this| {
                         this.child(
                             div()
@@ -4088,6 +4316,21 @@ impl PuppyTermView {
             .cloned()
             .expect("identity editor must exist");
         let focused = self.identity_editor_focus.is_focused(window);
+        let is_editing = editor.existing_key_id.is_some();
+        let title = if is_editing {
+            if editor.name.trim().is_empty() {
+                "Edit Identity".to_string()
+            } else {
+                format!("Edit {}", editor.name)
+            }
+        } else {
+            "New Identity".to_string()
+        };
+        let helper_text = if is_editing {
+            "Update the identity or switch to Paste Key Pair to replace the key material, then use Cmd/Ctrl+Enter to save."
+        } else {
+            "Click a field, type to edit, use Tab to move, and Cmd/Ctrl+Enter to save."
+        };
         let storage_buttons = [StorageMode::AppManaged, StorageMode::SystemSsh]
             .into_iter()
             .map(|mode| {
@@ -4161,7 +4404,7 @@ impl PuppyTermView {
                 div()
                     .text_3xl()
                     .font_weight(FontWeight::BOLD)
-                    .child("New Identity"),
+                    .child(title),
             )
             .child(
                 div()
@@ -4171,29 +4414,29 @@ impl PuppyTermView {
                     } else {
                         rgb(0x94a3b8)
                     })
-                    .child(
-                        "Click a field, type to edit, use Tab to move, and Cmd/Ctrl+Enter to save.",
-                    ),
+                    .child(helper_text),
             )
-            .child(
-                div()
-                    .mt_6()
-                    .child(div().text_sm().text_color(rgb(0x94a3b8)).child("Storage"))
-                    .child(div().mt_2().flex().gap_2().children(storage_buttons))
-                    .when(editor.storage_mode == StorageMode::SystemSsh, |this| {
-                        this.child(
-                            div()
-                                .mt_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x334155))
-                                .bg(rgb(0x0f172a))
-                                .p_3()
-                                .text_color(rgb(0x94a3b8))
-                                .child("System SSH stores keys in ~/.ssh. Existing keys are copied there and newly generated keys are created there."),
-                        )
-                    }),
-            )
+            .when(!is_editing, |this| {
+                this.child(
+                    div()
+                        .mt_6()
+                        .child(div().text_sm().text_color(rgb(0x94a3b8)).child("Storage"))
+                        .child(div().mt_2().flex().gap_2().children(storage_buttons))
+                        .when(editor.storage_mode == StorageMode::SystemSsh, |this| {
+                            this.child(
+                                div()
+                                    .mt_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(0x334155))
+                                    .bg(rgb(0x0f172a))
+                                    .p_3()
+                                    .text_color(rgb(0x94a3b8))
+                                    .child("System SSH stores keys in ~/.ssh. Existing keys are copied there and newly generated keys are created there."),
+                            )
+                        }),
+                )
+            })
             .child(div().mt_6().flex().gap_2().children(mode_buttons))
             .when_some(editor.error.as_ref(), |this, error| {
                 this.child(
@@ -4222,6 +4465,7 @@ impl PuppyTermView {
                         editor.cursor_offset,
                         editor_id,
                         IdentityFormField::Name,
+                        false,
                         cx,
                     ))
                     .when(editor.input_mode == IdentityInputMode::Existing, |this| {
@@ -4236,6 +4480,24 @@ impl PuppyTermView {
                             IdentityFormField::PrivateKeyPath,
                             cx,
                         ))
+                        .child(render_identity_input(
+                            "PuTTY Passphrase",
+                            &editor.private_key_passphrase,
+                            editor.focused_field == IdentityFormField::PrivateKeyPassphrase,
+                            editor.select_all
+                                && editor.focused_field == IdentityFormField::PrivateKeyPassphrase,
+                            editor.cursor_offset,
+                            editor_id,
+                            IdentityFormField::PrivateKeyPassphrase,
+                            true,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x94a3b8))
+                                .child("Optional. Used only when the selected key is an encrypted PuTTY .ppk."),
+                        )
                         .child(render_identity_path_input(
                             "Public Key Path",
                             &editor.public_key_path,
@@ -4256,6 +4518,7 @@ impl PuppyTermView {
                             editor.cursor_offset,
                             editor_id,
                             IdentityFormField::Fingerprint,
+                            false,
                             cx,
                         ))
                     })
@@ -4285,6 +4548,21 @@ impl PuppyTermView {
                             ),
                         )
                         .child(
+                            render_identity_input(
+                                "PuTTY Passphrase",
+                                &editor.private_key_passphrase,
+                                editor.focused_field == IdentityFormField::PrivateKeyPassphrase,
+                                editor.select_all
+                                    && editor.focused_field
+                                        == IdentityFormField::PrivateKeyPassphrase,
+                                editor.cursor_offset,
+                                editor_id,
+                                IdentityFormField::PrivateKeyPassphrase,
+                                true,
+                                cx,
+                            ),
+                        )
+                        .child(
                             div()
                                 .rounded_md()
                                 .border_1()
@@ -4293,7 +4571,7 @@ impl PuppyTermView {
                                 .p_3()
                                 .text_color(rgb(0xcbd5e1))
                                 .child(
-                                    "Paste from clipboard. If the public key is omitted, PuppyTerm derives it from the private key on save.",
+                                    "Paste from clipboard. If the public key is omitted, PuppyTerm derives it from the private key on save. PuTTY .ppk keys are converted automatically, and encrypted ones use the PuTTY passphrase field above.",
                                 ),
                         )
                     })
@@ -4333,7 +4611,7 @@ impl PuppyTermView {
                                             this.save_identity_editor(&editor_id, cx);
                                         }
                                     }))
-                                    .child("Save"),
+                                    .child(if is_editing { "Save Changes" } else { "Save" }),
                             )
                             .child(
                                 div()
@@ -5663,7 +5941,9 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
     } else {
         "Private"
     };
+    let can_edit = key.source == ProfileSource::AppManaged && key.can_use_for_identity_auth();
     let authorized_key = identity_public_key_preview_body(key);
+    let authorized_key_display = wrap_display_text(&authorized_key, 56);
     let authorized_key_available = !authorized_key.starts_with("Could not read public key.")
         && authorized_key != "No public key file is associated with this identity.";
     let path_label = key
@@ -5676,19 +5956,27 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                 .map(|path| path.display().to_string())
         })
         .unwrap_or_else(|| "No path".into());
+    let path_label_display = wrap_display_text(&path_label, 56);
+    let fingerprint_display = key
+        .fingerprint
+        .as_ref()
+        .map(|fingerprint| wrap_display_text(&format!("Fingerprint: {fingerprint}"), 56));
 
     div()
         .id(SharedString::from(format!("identity-row-{}", key.id)))
+        .w_full()
         .p_3()
         .rounded_md()
         .bg(rgb(0x1e293b))
         .child(
             div()
                 .flex()
+                .gap_2()
                 .justify_between()
-                .items_center()
+                .items_start()
                 .child(
                     div()
+                        .flex_1()
                         .text_sm()
                         .font_weight(FontWeight::BOLD)
                         .child(key.name.clone()),
@@ -5696,6 +5984,8 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
+                        .justify_end()
                         .items_center()
                         .gap_2()
                         .child(
@@ -5768,28 +6058,79 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                                     }),
                                 )
                                 .child(div().text_xs().child("Copy")),
+                        )
+                        .when(can_edit, |this| {
+                            this.child(
+                                div()
+                                    .id(SharedString::from(format!("identity-edit-{}", key.id)))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(0x0f172a))
+                                    .border_1()
+                                    .border_color(rgb(0x334155))
+                                    .hover(|this| this.bg(rgb(0x1e293b)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener({
+                                            let key_id = key.id.clone();
+                                            move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.edit_identity(&key_id, cx);
+                                            }
+                                        }),
+                                    )
+                                    .child(div().text_xs().child("Edit")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("identity-delete-{}", key.id)))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgb(0x1f1014))
+                                .border_1()
+                                .border_color(rgb(0x7f1d1d))
+                                .hover(|this| this.bg(rgb(0x3f1d24)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let key_id = key.id.clone();
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.delete_identity(&key_id, cx);
+                                        }
+                                    }),
+                                )
+                                .child(div().text_xs().text_color(rgb(0xfca5a5)).child("Delete")),
                         ),
                 ),
         )
         .child(
             div()
                 .mt_1()
+                .w_full()
                 .text_xs()
                 .text_color(rgb(0xcbd5e1))
-                .child(path_label),
+                .child(path_label_display),
         )
-        .when_some(key.fingerprint.as_ref(), |this, fingerprint| {
+        .when_some(fingerprint_display.as_ref(), |this, fingerprint| {
             this.child(
                 div()
                     .mt_1()
+                    .w_full()
                     .text_xs()
                     .text_color(rgb(0x94a3b8))
-                    .child(format!("Fingerprint: {fingerprint}")),
+                    .child(fingerprint.clone()),
             )
         })
         .child(
             div()
                 .mt_3()
+                .w_full()
                 .p_3()
                 .rounded_md()
                 .bg(rgb(0x0f172a))
@@ -5808,6 +6149,7 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                 .child(
                     div()
                         .mt_2()
+                        .w_full()
                         .font_family(".SystemUIFontMonospaced")
                         .text_xs()
                         .text_color(if authorized_key_available {
@@ -5815,9 +6157,148 @@ fn render_identity_row(key: &StoredKey, cx: &mut Context<PuppyTermView>) -> impl
                         } else {
                             rgb(0xfca5a5)
                         })
-                        .child(authorized_key.trim().to_string()),
+                        .child(authorized_key_display.trim().to_string()),
                 ),
         )
+}
+
+fn wrap_display_text(text: &str, max_columns: usize) -> String {
+    text.lines()
+        .map(|line| wrap_display_line(line, max_columns))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wrap_display_line(line: &str, max_columns: usize) -> String {
+    if max_columns == 0 || line.chars().count() <= max_columns {
+        return line.to_string();
+    }
+
+    let mut remaining = line.trim_end();
+    let mut wrapped = Vec::new();
+
+    while remaining.chars().count() > max_columns {
+        let split_at = split_point_for_display_line(remaining, max_columns);
+        let (head, tail) = remaining.split_at(split_at);
+        wrapped.push(head.trim_end().to_string());
+        remaining = tail.trim_start();
+    }
+
+    if !remaining.is_empty() || wrapped.is_empty() {
+        wrapped.push(remaining.to_string());
+    }
+
+    wrapped.join("\n")
+}
+
+fn split_point_for_display_line(line: &str, max_columns: usize) -> usize {
+    let mut split_at = line.len();
+    let mut columns = 0;
+
+    for (index, ch) in line.char_indices() {
+        if columns == max_columns {
+            split_at = index;
+            break;
+        }
+        columns += 1;
+        if columns == max_columns {
+            split_at = index + ch.len_utf8();
+            break;
+        }
+    }
+
+    line[..split_at]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| {
+            ch.is_whitespace()
+                || matches!(ch, '/' | '\\' | ':' | '_' | '-' | '.' | '=' | '?' | '&' | '+')
+        })
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(split_at)
+}
+
+fn identity_artifact_paths(key: &StoredKey) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for path in [
+        key.path.as_ref(),
+        key.public_key_path.as_ref(),
+        key.encrypted_blob_path.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !paths.iter().any(|existing| existing == path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
+fn delete_system_identity_files(key: &StoredKey) -> anyhow::Result<()> {
+    let ssh_dir = system_ssh_dir()?;
+    let private_key_path = key
+        .path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Identity is missing a private key path."))?;
+    if !private_key_path.starts_with(&ssh_dir) {
+        return Err(anyhow::anyhow!(
+            "Refusing to delete non-system key outside {}.",
+            ssh_dir.display()
+        ));
+    }
+
+    if private_key_path.exists() {
+        fs::remove_file(private_key_path)?;
+    }
+
+    let public_key_path = key
+        .public_key_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("{}.pub", private_key_path.display())));
+    if public_key_path.starts_with(&ssh_dir) && public_key_path.exists() {
+        fs::remove_file(public_key_path)?;
+    }
+
+    Ok(())
+}
+
+fn delete_authorized_key_entry(key: &StoredKey) -> anyhow::Result<()> {
+    let authorized_key = key
+        .inline_public_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Identity is missing an authorized_keys entry."))?;
+    let path = key
+        .path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Identity is missing an authorized_keys path."))?;
+
+    let contents = fs::read_to_string(path)?;
+    let updated = remove_authorized_key_entry_from_contents(&contents, authorized_key)
+        .ok_or_else(|| anyhow::anyhow!("Could not find matching authorized_keys entry."))?;
+    fs::write(path, updated)?;
+    Ok(())
+}
+
+fn remove_authorized_key_entry_from_contents(contents: &str, entry: &str) -> Option<String> {
+    let mut removed = false;
+    let mut kept = Vec::new();
+
+    for line in contents.lines() {
+        if !removed && line.trim() == entry.trim() {
+            removed = true;
+            continue;
+        }
+        kept.push(line);
+    }
+
+    removed.then(|| {
+        if kept.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", kept.join("\n"))
+        }
+    })
 }
 
 fn identity_public_key_preview_body(key: &StoredKey) -> String {
@@ -5990,6 +6471,93 @@ fn render_profile_input(
         )
 }
 
+fn render_profile_path_input(
+    label: &str,
+    value: &str,
+    active: bool,
+    select_all: bool,
+    cursor_offset: usize,
+    editor_id: &str,
+    cx: &mut Context<PuppyTermView>,
+) -> impl IntoElement {
+    let editor_id_for_input = editor_id.to_string();
+    let editor_id_for_button = editor_id.to_string();
+    let label = label.to_string();
+
+    div()
+        .child(div().text_sm().text_color(rgb(0x94a3b8)).child(label))
+        .child(
+            div()
+                .mt_2()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "profile-field-{}-{:?}",
+                            editor_id_for_input,
+                            ProfileFormField::IdentityPath
+                        )))
+                        .flex_1()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(0x0f172a))
+                        .font_family(".SystemUIFontMonospaced")
+                        .border_1()
+                        .border_color(if active { rgb(0x38bdf8) } else { rgb(0x1e293b) })
+                        .hover(|this| this.bg(rgb(0x111827)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.focus_profile_field_at(
+                                    &editor_id_for_input,
+                                    ProfileFormField::IdentityPath,
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(if active && select_all && !value.is_empty() {
+                            StyledText::new(value.to_string())
+                                .with_highlights([(0..value.len(), rgb(0x1d4ed8).into())])
+                                .into_any_element()
+                        } else if active {
+                            render_inline_input_cursor(value, cursor_offset).into_any_element()
+                        } else {
+                            div()
+                                .child(if value.is_empty() {
+                                    "<empty>".to_string()
+                                } else {
+                                    value.to_string()
+                                })
+                                .into_any_element()
+                        }),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "profile-browse-{}-identity",
+                            editor_id_for_button
+                        )))
+                        .px_4()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(0x1e293b))
+                        .border_1()
+                        .border_color(rgb(0x334155))
+                        .hover(|this| this.bg(rgb(0x334155)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_profile_identity_file(&editor_id_for_button, cx);
+                        }))
+                        .child("Browse"),
+                ),
+        )
+}
+
 fn render_identity_input(
     label: &str,
     value: &str,
@@ -5998,10 +6566,16 @@ fn render_identity_input(
     cursor_offset: usize,
     editor_id: &str,
     field: IdentityFormField,
+    masked: bool,
     cx: &mut Context<PuppyTermView>,
 ) -> impl IntoElement {
     let editor_id = editor_id.to_string();
     let label = label.to_string();
+    let display_value = if masked && !value.is_empty() {
+        "*".repeat(value.chars().count())
+    } else {
+        value.to_string()
+    };
 
     div()
         .child(div().text_sm().text_color(rgb(0x94a3b8)).child(label))
@@ -6027,18 +6601,18 @@ fn render_identity_input(
                         this.focus_identity_field_at(&editor_id, field, event.position, window, cx);
                     }),
                 )
-                .child(if active && select_all && !value.is_empty() {
-                    StyledText::new(value.to_string())
-                        .with_highlights([(0..value.len(), rgb(0x1d4ed8).into())])
+                .child(if active && select_all && !display_value.is_empty() {
+                    StyledText::new(display_value.clone())
+                        .with_highlights([(0..display_value.len(), rgb(0x1d4ed8).into())])
                         .into_any_element()
                 } else if active {
-                    render_inline_input_cursor(value, cursor_offset).into_any_element()
+                    render_inline_input_cursor(&display_value, cursor_offset).into_any_element()
                 } else {
                     div()
-                        .child(if value.is_empty() {
+                        .child(if display_value.is_empty() {
                             "<empty>".to_string()
                         } else {
-                            value.to_string()
+                            display_value.clone()
                         })
                         .into_any_element()
                 }),
@@ -6301,6 +6875,7 @@ fn identity_field_value_mut(
     match field {
         IdentityFormField::Name => &mut editor.name,
         IdentityFormField::PrivateKeyPath => &mut editor.private_key_path,
+        IdentityFormField::PrivateKeyPassphrase => &mut editor.private_key_passphrase,
         IdentityFormField::PublicKeyPath => &mut editor.public_key_path,
         IdentityFormField::PrivateKeyText => &mut editor.private_key_text,
         IdentityFormField::PublicKeyText => &mut editor.public_key_text,
@@ -6312,6 +6887,7 @@ fn identity_field_value(editor: &IdentityEditorState, field: IdentityFormField) 
     match field {
         IdentityFormField::Name => &editor.name,
         IdentityFormField::PrivateKeyPath => &editor.private_key_path,
+        IdentityFormField::PrivateKeyPassphrase => &editor.private_key_passphrase,
         IdentityFormField::PublicKeyPath => &editor.public_key_path,
         IdentityFormField::PrivateKeyText => &editor.private_key_text,
         IdentityFormField::PublicKeyText => &editor.public_key_text,
@@ -6324,6 +6900,7 @@ fn identity_editor_fields(mode: IdentityInputMode) -> &'static [IdentityFormFiel
         IdentityInputMode::Existing => &[
             IdentityFormField::Name,
             IdentityFormField::PrivateKeyPath,
+            IdentityFormField::PrivateKeyPassphrase,
             IdentityFormField::PublicKeyPath,
             IdentityFormField::Fingerprint,
         ],
@@ -6331,6 +6908,7 @@ fn identity_editor_fields(mode: IdentityInputMode) -> &'static [IdentityFormFiel
             IdentityFormField::Name,
             IdentityFormField::PrivateKeyText,
             IdentityFormField::PublicKeyText,
+            IdentityFormField::PrivateKeyPassphrase,
         ],
         IdentityInputMode::CreateNew => &[IdentityFormField::Name],
     }
@@ -6354,6 +6932,35 @@ fn sanitize_key_filename(name: &str) -> String {
     } else {
         sanitized
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PuttyPrivateKeyInfo {
+    version: u8,
+    algorithm: String,
+    encryption: String,
+}
+
+fn parse_putty_private_key_info(contents: &str) -> Option<PuttyPrivateKeyInfo> {
+    let mut lines = contents.lines();
+    let header = lines.next()?.trim();
+    let encryption_line = lines.next()?.trim();
+
+    let (version, algorithm) = if let Some(algorithm) = header.strip_prefix("PuTTY-User-Key-File-2:")
+    {
+        (2, algorithm.trim())
+    } else if let Some(algorithm) = header.strip_prefix("PuTTY-User-Key-File-3:") {
+        (3, algorithm.trim())
+    } else {
+        return None;
+    };
+
+    let encryption = encryption_line.strip_prefix("Encryption:")?.trim();
+    Some(PuttyPrivateKeyInfo {
+        version,
+        algorithm: algorithm.to_string(),
+        encryption: encryption.to_string(),
+    })
 }
 
 fn summarize_pasted_key(value: &str) -> String {
@@ -6524,6 +7131,201 @@ fn write_public_key_file(path: &std::path::Path, contents: &str) -> anyhow::Resu
     Ok(())
 }
 
+fn putty_private_key_info_for_path(
+    private_key_path: &std::path::Path,
+) -> anyhow::Result<Option<PuttyPrivateKeyInfo>> {
+    Ok(parse_putty_private_key_info(&fs::read_to_string(
+        private_key_path,
+    )?))
+}
+
+fn app_identity_paths(
+    key_blobs: &std::path::Path,
+    key_name: &str,
+    key_id: &str,
+) -> (PathBuf, PathBuf) {
+    let base_name = sanitize_key_filename(key_name);
+    let suffix_len = key_id.len().min(8);
+    let private_key_path = key_blobs.join(format!("{}_{}", base_name, &key_id[..suffix_len]));
+    let public_key_path = private_key_path.with_extension("pub");
+    (private_key_path, public_key_path)
+}
+
+fn ensure_identity_target_paths_available(
+    private_key_path: &std::path::Path,
+    public_key_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !private_key_path.exists() && !public_key_path.exists(),
+        "Target identity files already exist at {}.",
+        private_key_path.display()
+    );
+    Ok(())
+}
+
+fn with_replaceable_identity_targets<T>(
+    private_key_path: &std::path::Path,
+    public_key_path: &std::path::Path,
+    replace_existing: bool,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if !replace_existing {
+        ensure_identity_target_paths_available(private_key_path, public_key_path)?;
+        return operation();
+    }
+
+    let mut backups = Vec::new();
+    for target in [private_key_path, public_key_path] {
+        if !target.exists() {
+            continue;
+        }
+
+        let file_name = target
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid identity target path {}.", target.display()))?
+            .to_string_lossy();
+        let backup_path = target.with_file_name(format!(
+            "{file_name}.puppyterm-backup-{}",
+            Uuid::new_v4()
+        ));
+        fs::rename(target, &backup_path)?;
+        backups.push((target.to_path_buf(), backup_path));
+    }
+
+    match operation() {
+        Ok(result) => {
+            for (_, backup_path) in backups {
+                let _ = fs::remove_file(backup_path);
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            for (target_path, _) in &backups {
+                if target_path.exists() {
+                    let _ = fs::remove_file(target_path);
+                }
+            }
+            for (target_path, backup_path) in backups {
+                let _ = fs::rename(backup_path, target_path);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn write_passphrase_file(passphrase: Option<&str>) -> anyhow::Result<Option<PathBuf>> {
+    let Some(passphrase) = passphrase else {
+        return Ok(None);
+    };
+    let path =
+        std::env::temp_dir().join(format!("puppyterm-putty-passphrase-{}.txt", Uuid::new_v4()));
+    write_private_key_file(&path, passphrase)?;
+    Ok(Some(path))
+}
+
+fn convert_putty_private_key_file(
+    source_path: &std::path::Path,
+    target_private_key_path: &std::path::Path,
+    target_public_key_path: &std::path::Path,
+    info: &PuttyPrivateKeyInfo,
+    replace_existing: bool,
+    putty_passphrase: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        info.encryption.eq_ignore_ascii_case("none") || putty_passphrase.is_some(),
+        "This PuTTY .ppk key is encrypted. Enter its PuTTY passphrase to convert it automatically."
+    );
+    with_replaceable_identity_targets(
+        target_private_key_path,
+        target_public_key_path,
+        replace_existing,
+        || {
+            let old_passphrase_file = write_passphrase_file(putty_passphrase)?;
+            let new_passphrase_file = std::env::temp_dir()
+                .join(format!("puppyterm-putty-new-passphrase-{}.txt", Uuid::new_v4()));
+            write_private_key_file(&new_passphrase_file, "")?;
+
+            let mut command = Command::new("puttygen");
+            command
+                .arg(source_path)
+                .arg("-O")
+                .arg("private-openssh")
+                .arg("-o")
+                .arg(target_private_key_path)
+                .arg("--new-passphrase")
+                .arg(&new_passphrase_file);
+            if let Some(old_passphrase_file) = old_passphrase_file.as_ref() {
+                command.arg("--old-passphrase").arg(old_passphrase_file);
+            }
+
+            let output = match command.output() {
+                Ok(output) => Ok(output),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+                    anyhow::anyhow!(
+                        "PuTTY key conversion requires `puttygen` to be installed and available on PATH."
+                    ),
+                ),
+                Err(error) => Err(error.into()),
+            };
+            let _ = fs::remove_file(&new_passphrase_file);
+            if let Some(old_passphrase_file) = old_passphrase_file.as_ref() {
+                let _ = fs::remove_file(old_passphrase_file);
+            }
+            let output = output?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                anyhow::bail!(
+                    "puttygen failed{}",
+                    if stderr.is_empty() {
+                        ".".to_string()
+                    } else {
+                        format!(": {stderr}")
+                    }
+                );
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    target_private_key_path,
+                    fs::Permissions::from_mode(0o600),
+                )?;
+            }
+
+            let public_key = public_key_for_private_key(target_private_key_path, None)?;
+            write_public_key_file(target_public_key_path, &public_key)?;
+            Ok(())
+        },
+    )
+}
+
+fn convert_putty_private_key_text(
+    private_key_text: &str,
+    target_private_key_path: &std::path::Path,
+    target_public_key_path: &std::path::Path,
+    info: &PuttyPrivateKeyInfo,
+    replace_existing: bool,
+    putty_passphrase: Option<&str>,
+) -> anyhow::Result<()> {
+    let temp_source_path = std::env::temp_dir().join(format!(
+        "puppyterm-putty-{}.ppk",
+        Uuid::new_v4()
+    ));
+    write_private_key_file(&temp_source_path, private_key_text)?;
+    let result = convert_putty_private_key_file(
+        &temp_source_path,
+        target_private_key_path,
+        target_public_key_path,
+        info,
+        replace_existing,
+        putty_passphrase,
+    );
+    let _ = fs::remove_file(&temp_source_path);
+    result
+}
+
 fn import_pasted_keypair(
     key_name: &str,
     private_key_path: PathBuf,
@@ -6532,19 +7334,34 @@ fn import_pasted_keypair(
     public_key_text: Option<&str>,
     source: ProfileSource,
     id: String,
+    replace_existing: bool,
+    putty_passphrase: Option<&str>,
 ) -> anyhow::Result<StoredKey> {
-    anyhow::ensure!(
-        !private_key_path.exists() && !public_key_path.exists(),
-        "Target identity files already exist at {}.",
-        private_key_path.display()
-    );
-
-    write_private_key_file(&private_key_path, private_key_text)?;
-    let public_key = match public_key_text {
-        Some(public_key_text) => public_key_text.trim().to_string(),
-        None => public_key_for_private_key(&private_key_path, None)?,
-    };
-    write_public_key_file(&public_key_path, &public_key)?;
+    with_replaceable_identity_targets(
+        &private_key_path,
+        &public_key_path,
+        replace_existing,
+        || {
+            if let Some(info) = parse_putty_private_key_info(private_key_text) {
+                convert_putty_private_key_text(
+                    private_key_text,
+                    &private_key_path,
+                    &public_key_path,
+                    &info,
+                    false,
+                    putty_passphrase,
+                )?;
+            } else {
+                write_private_key_file(&private_key_path, private_key_text)?;
+                let public_key = match public_key_text {
+                    Some(public_key_text) => public_key_text.trim().to_string(),
+                    None => public_key_for_private_key(&private_key_path, None)?,
+                };
+                write_public_key_file(&public_key_path, &public_key)?;
+            }
+            Ok(())
+        },
+    )?;
 
     let fingerprint = fingerprint_for_public_key(&public_key_path);
     Ok(StoredKey {
@@ -6564,6 +7381,7 @@ fn install_system_identity_key(
     key_name: &str,
     private_key_path: &std::path::Path,
     public_key_path: Option<&std::path::Path>,
+    putty_passphrase: Option<&str>,
 ) -> anyhow::Result<StoredKey> {
     let ssh_dir = system_ssh_dir()?;
     let private_target = ssh_dir.join(sanitize_key_filename(key_name));
@@ -6574,9 +7392,20 @@ fn install_system_identity_key(
         private_target.display()
     );
 
-    fs::copy(private_key_path, &private_target)?;
-    let public_key = public_key_for_private_key(private_key_path, public_key_path)?;
-    fs::write(&public_target, format!("{public_key}\n"))?;
+    if let Some(info) = putty_private_key_info_for_path(private_key_path)? {
+        convert_putty_private_key_file(
+            private_key_path,
+            &private_target,
+            &public_target,
+            &info,
+            false,
+            putty_passphrase,
+        )?;
+    } else {
+        fs::copy(private_key_path, &private_target)?;
+        let public_key = public_key_for_private_key(private_key_path, public_key_path)?;
+        fs::write(&public_target, format!("{public_key}\n"))?;
+    }
 
     let fingerprint = fingerprint_for_public_key(&public_target);
     Ok(StoredKey {
@@ -6598,11 +7427,10 @@ fn import_pasted_app_identity_key(
     key_name: &str,
     private_key_text: &str,
     public_key_text: Option<&str>,
+    replace_existing: bool,
+    putty_passphrase: Option<&str>,
 ) -> anyhow::Result<StoredKey> {
-    let base_name = sanitize_key_filename(key_name);
-    let suffix_len = key_id.len().min(8);
-    let private_key_path = key_blobs.join(format!("{}_{}", base_name, &key_id[..suffix_len]));
-    let public_key_path = private_key_path.with_extension("pub");
+    let (private_key_path, public_key_path) = app_identity_paths(key_blobs, key_name, key_id);
     import_pasted_keypair(
         key_name,
         private_key_path,
@@ -6611,6 +7439,8 @@ fn import_pasted_app_identity_key(
         public_key_text,
         ProfileSource::AppManaged,
         key_id.to_string(),
+        replace_existing,
+        putty_passphrase,
     )
 }
 
@@ -6618,6 +7448,7 @@ fn import_pasted_system_identity_key(
     key_name: &str,
     private_key_text: &str,
     public_key_text: Option<&str>,
+    putty_passphrase: Option<&str>,
 ) -> anyhow::Result<StoredKey> {
     let ssh_dir = system_ssh_dir()?;
     let private_key_path = ssh_dir.join(sanitize_key_filename(key_name));
@@ -6630,6 +7461,8 @@ fn import_pasted_system_identity_key(
         public_key_text,
         ProfileSource::SystemDiscovered,
         Uuid::new_v4().to_string(),
+        false,
+        putty_passphrase,
     )
 }
 
@@ -6637,34 +7470,39 @@ fn generate_new_app_identity_key(
     key_blobs: &std::path::Path,
     key_id: &str,
     key_name: &str,
+    replace_existing: bool,
 ) -> anyhow::Result<StoredKey> {
-    let base_name = sanitize_key_filename(key_name);
-    let suffix_len = key_id.len().min(8);
-    let private_key_path = key_blobs.join(format!("{}_{}", base_name, &key_id[..suffix_len]));
-    let public_key_path = private_key_path.with_extension("pub");
+    let (private_key_path, public_key_path) = app_identity_paths(key_blobs, key_name, key_id);
+    with_replaceable_identity_targets(
+        &private_key_path,
+        &public_key_path,
+        replace_existing,
+        || {
+            let output = Command::new("ssh-keygen")
+                .arg("-t")
+                .arg("ed25519")
+                .arg("-N")
+                .arg("")
+                .arg("-C")
+                .arg(key_name)
+                .arg("-f")
+                .arg(&private_key_path)
+                .output()?;
 
-    let output = Command::new("ssh-keygen")
-        .arg("-t")
-        .arg("ed25519")
-        .arg("-N")
-        .arg("")
-        .arg("-C")
-        .arg(key_name)
-        .arg("-f")
-        .arg(&private_key_path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "ssh-keygen failed{}",
-            if stderr.is_empty() {
-                ".".to_string()
-            } else {
-                format!(": {stderr}")
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                anyhow::bail!(
+                    "ssh-keygen failed{}",
+                    if stderr.is_empty() {
+                        ".".to_string()
+                    } else {
+                        format!(": {stderr}")
+                    }
+                );
             }
-        );
-    }
+            Ok(())
+        },
+    )?;
 
     let fingerprint = fingerprint_for_public_key(&public_key_path);
 
@@ -6679,6 +7517,90 @@ fn generate_new_app_identity_key(
         encrypted_blob_path: None,
         meta: crate::domain::RecordMeta::new(),
     })
+}
+
+fn import_existing_app_identity_key(
+    key_blobs: &std::path::Path,
+    key_id: &str,
+    key_name: &str,
+    private_key_path: &std::path::Path,
+    public_key_path: Option<&std::path::Path>,
+    fingerprint: Option<&str>,
+    replace_existing: bool,
+    putty_passphrase: Option<&str>,
+) -> anyhow::Result<StoredKey> {
+    if let Some(info) = putty_private_key_info_for_path(private_key_path)? {
+        let (private_target, public_target) = app_identity_paths(key_blobs, key_name, key_id);
+        convert_putty_private_key_file(
+            private_key_path,
+            &private_target,
+            &public_target,
+            &info,
+            replace_existing,
+            putty_passphrase,
+        )?;
+        let fingerprint = fingerprint_for_public_key(&public_target);
+        return Ok(StoredKey {
+            id: key_id.to_string(),
+            source: ProfileSource::AppManaged,
+            name: key_name.to_string(),
+            path: Some(private_target),
+            public_key_path: Some(public_target),
+            inline_public_key: None,
+            fingerprint,
+            encrypted_blob_path: None,
+            meta: crate::domain::RecordMeta::new(),
+        });
+    }
+
+    Ok(StoredKey {
+        id: key_id.to_string(),
+        source: ProfileSource::AppManaged,
+        name: key_name.to_string(),
+        path: Some(private_key_path.to_path_buf()),
+        public_key_path: public_key_path.map(ToOwned::to_owned),
+        inline_public_key: None,
+        fingerprint: fingerprint.map(ToOwned::to_owned),
+        encrypted_blob_path: None,
+        meta: crate::domain::RecordMeta::new(),
+    })
+}
+
+fn prepare_app_profile_identity_path(
+    key_blobs: &std::path::Path,
+    profile_id: &str,
+    profile_name: &str,
+    private_key_path: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let Some(info) = putty_private_key_info_for_path(private_key_path)? else {
+        return Ok(private_key_path.to_path_buf());
+    };
+
+    let conversion_name = format!("{}_identity", sanitize_key_filename(profile_name));
+    let (private_target, public_target) =
+        app_identity_paths(key_blobs, &conversion_name, profile_id);
+    convert_putty_private_key_file(
+        private_key_path,
+        &private_target,
+        &public_target,
+        &info,
+        false,
+        None,
+    )?;
+    Ok(private_target)
+}
+
+fn prepare_system_profile_identity_path(
+    profile_name: &str,
+    private_key_path: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let Some(_) = putty_private_key_info_for_path(private_key_path)? else {
+        return Ok(private_key_path.to_path_buf());
+    };
+
+    let key = install_system_identity_key(profile_name, private_key_path, None, None)?;
+    key.path
+        .ok_or_else(|| anyhow::anyhow!("Converted key is missing a private key path."))
 }
 
 fn generate_new_system_identity_key(key_name: &str) -> anyhow::Result<StoredKey> {
@@ -6875,7 +7797,14 @@ fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_terminal_cursor;
+    use std::fs;
+
+    use super::{
+        convert_putty_private_key_file, parse_putty_private_key_info,
+        remove_authorized_key_entry_from_contents, render_terminal_cursor,
+        with_replaceable_identity_targets, wrap_display_text, PuttyPrivateKeyInfo,
+    };
+    use tempfile::tempdir;
 
     #[test]
     fn cursor_stays_on_last_visible_line_without_trailing_newline() {
@@ -6889,6 +7818,103 @@ mod tests {
     fn cursor_can_render_on_trailing_blank_line_after_newline() {
         let rendered = render_terminal_cursor("line 1\n", 1, 0);
         assert_eq!(rendered, "line 1\n█");
+    }
+
+    #[test]
+    fn parses_putty_private_key_v2_header() {
+        let info = parse_putty_private_key_info(
+            "PuTTY-User-Key-File-2: ssh-rsa\nEncryption: aes256-cbc\nComment: teepus\n",
+        )
+        .expect("expected PuTTY header to parse");
+
+        assert_eq!(info.version, 2);
+        assert_eq!(info.algorithm, "ssh-rsa");
+        assert_eq!(info.encryption, "aes256-cbc");
+    }
+
+    #[test]
+    fn ignores_non_putty_private_key_header() {
+        assert!(parse_putty_private_key_info("-----BEGIN OPENSSH PRIVATE KEY-----\n").is_none());
+    }
+
+    #[test]
+    fn wraps_long_unbroken_text_for_display() {
+        assert_eq!(wrap_display_text("abcdefghijklmnopqrstuvwxyz", 8), "abcdefgh\nijklmnop\nqrstuvwx\nyz");
+    }
+
+    #[test]
+    fn wraps_at_delimiters_when_available() {
+        assert_eq!(
+            wrap_display_text("/home/teppo/.local/share/puppyterm", 12),
+            "/home/teppo/\n.local/\nshare/\npuppyterm"
+        );
+    }
+
+    #[test]
+    fn removes_one_authorized_key_entry_from_contents() {
+        let contents = "ssh-ed25519 AAAA first\nssh-rsa BBBB second\n";
+        let updated = remove_authorized_key_entry_from_contents(contents, "ssh-rsa BBBB second")
+            .expect("expected authorized_keys entry to be removed");
+
+        assert_eq!(updated, "ssh-ed25519 AAAA first\n");
+    }
+
+    #[test]
+    fn restores_existing_identity_files_when_replacement_fails() {
+        let temp = tempdir().expect("expected temp dir");
+        let private_key_path = temp.path().join("id_ed25519");
+        let public_key_path = temp.path().join("id_ed25519.pub");
+        fs::write(&private_key_path, "old-private").expect("expected private key fixture");
+        fs::write(&public_key_path, "old-public").expect("expected public key fixture");
+
+        let result = with_replaceable_identity_targets(
+            &private_key_path,
+            &public_key_path,
+            true,
+            || -> anyhow::Result<()> {
+                fs::write(&private_key_path, "new-private")?;
+                anyhow::bail!("boom");
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&private_key_path).expect("expected restored private key"),
+            "old-private"
+        );
+        assert_eq!(
+            fs::read_to_string(&public_key_path).expect("expected restored public key"),
+            "old-public"
+        );
+    }
+
+    #[test]
+    fn encrypted_putty_conversion_requires_passphrase() {
+        let temp = tempdir().expect("expected temp dir");
+        let source_path = temp.path().join("source.ppk");
+        let private_key_path = temp.path().join("converted");
+        let public_key_path = temp.path().join("converted.pub");
+        let info = PuttyPrivateKeyInfo {
+            version: 3,
+            algorithm: "ssh-ed25519".into(),
+            encryption: "aes256-cbc".into(),
+        };
+
+        let error = convert_putty_private_key_file(
+            &source_path,
+            &private_key_path,
+            &public_key_path,
+            &info,
+            false,
+            None,
+        )
+        .expect_err("expected encrypted key conversion to require a passphrase");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Enter its PuTTY passphrase to convert it automatically")
+        );
     }
 }
 
