@@ -854,6 +854,93 @@ impl PuppyTermView {
         cx.notify();
     }
 
+    fn download_sftp_entry(&mut self, profile_id: &str, name: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(browser) = self.sftp_browsers.get(profile_id).cloned() else {
+            return;
+        };
+
+        let remote_path = join_remote_path(&browser.path, name);
+        let entry_name = name.to_string();
+        let profile_name = profile.display_name.clone();
+        let profile_id = profile_id.to_string();
+        let ssh_backend = Arc::clone(&self.services.ssh_backend);
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(format!("Choose download folder for {entry_name}").into()),
+        });
+
+        cx.spawn(async move |this_entity, cx| {
+            let Ok(result) = receiver.await else {
+                return;
+            };
+            let Ok(selection) = result else {
+                let _ = this_entity.update(cx, |this, cx| {
+                    if let Some(browser) = this.sftp_browsers.get_mut(profile_id.as_str()) {
+                        browser.error = Some("Could not open folder picker.".into());
+                        cx.notify();
+                    }
+                });
+                return;
+            };
+            let Some(destination_dir) = selection.and_then(|mut paths| paths.drain(..).next())
+            else {
+                return;
+            };
+            let local_path = destination_dir.join(&entry_name);
+            let operation = SftpOperation::Download {
+                remote_path,
+                local_path: local_path.clone(),
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { ssh_backend.run_sftp_op(&profile, &operation) })
+                .await;
+
+            let _ = this_entity.update(cx, |this, cx| {
+                match result {
+                    Ok(result) if result.success => {
+                        this.add_log(format!(
+                            "Downloaded {} from {} to {}.",
+                            entry_name,
+                            profile_name,
+                            local_path.display()
+                        ));
+                        if let Some(browser) = this.sftp_browsers.get_mut(profile_id.as_str()) {
+                            browser.error = None;
+                        }
+                    }
+                    Ok(result) => {
+                        this.add_log(format!(
+                            "Download failed for {}: {}",
+                            entry_name, result.stderr
+                        ));
+                        if let Some(browser) = this.sftp_browsers.get_mut(profile_id.as_str()) {
+                            browser.error = Some(result.stderr);
+                        }
+                    }
+                    Err(error) => {
+                        this.add_log(format!("Download failed for {}: {error}", entry_name));
+                        if let Some(browser) = this.sftp_browsers.get_mut(profile_id.as_str()) {
+                            browser.error = Some(error.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn open_sftp_entry(&mut self, profile_id: &str, name: &str, cx: &mut Context<Self>) {
         if name == "." {
             return;
@@ -1512,10 +1599,9 @@ impl PuppyTermView {
                         &display_name,
                         &selected_identity_path,
                     ),
-                    StorageMode::SystemSsh => prepare_system_profile_identity_path(
-                        &display_name,
-                        &selected_identity_path,
-                    ),
+                    StorageMode::SystemSsh => {
+                        prepare_system_profile_identity_path(&display_name, &selected_identity_path)
+                    }
                 };
                 profile.identity_path = Some(match resolved_identity_path {
                     Ok(path) => path,
@@ -2013,7 +2099,10 @@ impl PuppyTermView {
                     cx.notify();
                 }
                 Err(error) => {
-                    self.add_log(format!("Identity deletion failed for {}: {error}", key.name));
+                    self.add_log(format!(
+                        "Identity deletion failed for {}: {error}",
+                        key.name
+                    ));
                     cx.notify();
                 }
             }
@@ -2042,7 +2131,10 @@ impl PuppyTermView {
                 self.refresh(cx);
             }
             Err(error) => {
-                self.add_log(format!("Identity deletion failed for {}: {error}", key.name));
+                self.add_log(format!(
+                    "Identity deletion failed for {}: {error}",
+                    key.name
+                ));
                 cx.notify();
             }
         }
@@ -2232,12 +2324,11 @@ impl PuppyTermView {
     }
 
     fn cleanup_app_identity_artifacts(&self, key: &StoredKey, replacement: Option<&StoredKey>) {
-        let protected_paths = replacement
-            .map(identity_artifact_paths)
-            .unwrap_or_default();
+        let protected_paths = replacement.map(identity_artifact_paths).unwrap_or_default();
 
         for path in identity_artifact_paths(key) {
-            if !path.starts_with(&self.services.paths.key_blobs) || protected_paths.contains(&path) {
+            if !path.starts_with(&self.services.paths.key_blobs) || protected_paths.contains(&path)
+            {
                 continue;
             }
             let _ = fs::remove_file(path);
@@ -5761,7 +5852,39 @@ impl PuppyTermView {
                                         }))
                                         .into_any_element()
                                 } else {
-                                    row.into_any_element()
+                                    row.child(
+                                        div().mt_3().flex().justify_end().child(
+                                            div()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(rgb(0x111827))
+                                                .border_1()
+                                                .border_color(rgb(0x1e293b))
+                                                .hover(|this| this.bg(rgb(0x1e293b)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener({
+                                                        let profile_id = profile_id.to_string();
+                                                        move |this, _, _, cx| {
+                                                            this.download_sftp_entry(
+                                                                &profile_id,
+                                                                &entry_name,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child("Download"),
+                                                ),
+                                        ),
+                                    )
+                                    .into_any_element()
                                 }
                             })
                             .collect::<Vec<_>>()
@@ -6212,7 +6335,10 @@ fn split_point_for_display_line(line: &str, max_columns: usize) -> usize {
         .rev()
         .find(|(_, ch)| {
             ch.is_whitespace()
-                || matches!(ch, '/' | '\\' | ':' | '_' | '-' | '.' | '=' | '?' | '&' | '+')
+                || matches!(
+                    ch,
+                    '/' | '\\' | ':' | '_' | '-' | '.' | '=' | '?' | '&' | '+'
+                )
         })
         .map(|(index, ch)| index + ch.len_utf8())
         .unwrap_or(split_at)
@@ -6946,14 +7072,14 @@ fn parse_putty_private_key_info(contents: &str) -> Option<PuttyPrivateKeyInfo> {
     let header = lines.next()?.trim();
     let encryption_line = lines.next()?.trim();
 
-    let (version, algorithm) = if let Some(algorithm) = header.strip_prefix("PuTTY-User-Key-File-2:")
-    {
-        (2, algorithm.trim())
-    } else if let Some(algorithm) = header.strip_prefix("PuTTY-User-Key-File-3:") {
-        (3, algorithm.trim())
-    } else {
-        return None;
-    };
+    let (version, algorithm) =
+        if let Some(algorithm) = header.strip_prefix("PuTTY-User-Key-File-2:") {
+            (2, algorithm.trim())
+        } else if let Some(algorithm) = header.strip_prefix("PuTTY-User-Key-File-3:") {
+            (3, algorithm.trim())
+        } else {
+            return None;
+        };
 
     let encryption = encryption_line.strip_prefix("Encryption:")?.trim();
     Some(PuttyPrivateKeyInfo {
@@ -7184,10 +7310,8 @@ fn with_replaceable_identity_targets<T>(
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("Invalid identity target path {}.", target.display()))?
             .to_string_lossy();
-        let backup_path = target.with_file_name(format!(
-            "{file_name}.puppyterm-backup-{}",
-            Uuid::new_v4()
-        ));
+        let backup_path =
+            target.with_file_name(format!("{file_name}.puppyterm-backup-{}", Uuid::new_v4()));
         fs::rename(target, &backup_path)?;
         backups.push((target.to_path_buf(), backup_path));
     }
@@ -7241,8 +7365,10 @@ fn convert_putty_private_key_file(
         replace_existing,
         || {
             let old_passphrase_file = write_passphrase_file(putty_passphrase)?;
-            let new_passphrase_file = std::env::temp_dir()
-                .join(format!("puppyterm-putty-new-passphrase-{}.txt", Uuid::new_v4()));
+            let new_passphrase_file = std::env::temp_dir().join(format!(
+                "puppyterm-putty-new-passphrase-{}.txt",
+                Uuid::new_v4()
+            ));
             write_private_key_file(&new_passphrase_file, "")?;
 
             let mut command = Command::new("puttygen");
@@ -7260,11 +7386,9 @@ fn convert_putty_private_key_file(
 
             let output = match command.output() {
                 Ok(output) => Ok(output),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
-                    anyhow::anyhow!(
-                        "PuTTY key conversion requires `puttygen` to be installed and available on PATH."
-                    ),
-                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+                    "PuTTY key conversion requires `puttygen` to be installed and available on PATH."
+                )),
                 Err(error) => Err(error.into()),
             };
             let _ = fs::remove_file(&new_passphrase_file);
@@ -7288,10 +7412,7 @@ fn convert_putty_private_key_file(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(
-                    target_private_key_path,
-                    fs::Permissions::from_mode(0o600),
-                )?;
+                fs::set_permissions(target_private_key_path, fs::Permissions::from_mode(0o600))?;
             }
 
             let public_key = public_key_for_private_key(target_private_key_path, None)?;
@@ -7309,10 +7430,8 @@ fn convert_putty_private_key_text(
     replace_existing: bool,
     putty_passphrase: Option<&str>,
 ) -> anyhow::Result<()> {
-    let temp_source_path = std::env::temp_dir().join(format!(
-        "puppyterm-putty-{}.ppk",
-        Uuid::new_v4()
-    ));
+    let temp_source_path =
+        std::env::temp_dir().join(format!("puppyterm-putty-{}.ppk", Uuid::new_v4()));
     write_private_key_file(&temp_source_path, private_key_text)?;
     let result = convert_putty_private_key_file(
         &temp_source_path,
@@ -7800,9 +7919,9 @@ mod tests {
     use std::fs;
 
     use super::{
-        convert_putty_private_key_file, parse_putty_private_key_info,
+        PuttyPrivateKeyInfo, convert_putty_private_key_file, parse_putty_private_key_info,
         remove_authorized_key_entry_from_contents, render_terminal_cursor,
-        with_replaceable_identity_targets, wrap_display_text, PuttyPrivateKeyInfo,
+        with_replaceable_identity_targets, wrap_display_text,
     };
     use tempfile::tempdir;
 
@@ -7839,7 +7958,10 @@ mod tests {
 
     #[test]
     fn wraps_long_unbroken_text_for_display() {
-        assert_eq!(wrap_display_text("abcdefghijklmnopqrstuvwxyz", 8), "abcdefgh\nijklmnop\nqrstuvwx\nyz");
+        assert_eq!(
+            wrap_display_text("abcdefghijklmnopqrstuvwxyz", 8),
+            "abcdefgh\nijklmnop\nqrstuvwx\nyz"
+        );
     }
 
     #[test]

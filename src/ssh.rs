@@ -499,6 +499,15 @@ mod tests {
     }
 
     #[test]
+    fn serializes_sftp_download_operation() {
+        let batch = OpenSshBackend::serialize_sftp_batch(&SftpOperation::Download {
+            remote_path: "/srv/app.log".into(),
+            local_path: "/tmp/app.log".into(),
+        });
+        assert_eq!(batch, "get /srv/app.log /tmp/app.log\n");
+    }
+
+    #[test]
     fn previews_tunnel_variants() {
         let spec = TunnelSpec {
             id: "t1".into(),
