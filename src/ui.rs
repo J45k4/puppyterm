@@ -2,9 +2,9 @@ use std::{collections::HashMap, fs, path::PathBuf, process::Command, sync::Arc, 
 
 use gpui::{
     App, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
-    Render, ScrollWheelEvent, SharedString, StyledText, TextRun, Timer, Window, div, font, img,
-    prelude::*, px, rgb,
+    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, Render, ScrollWheelEvent, SharedString, StyledText, TextRun, Timer, Window, div,
+    font, img, prelude::*, px, rgb,
 };
 use uuid::Uuid;
 
@@ -3177,10 +3177,17 @@ impl PuppyTermView {
     fn on_terminal_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.to_lowercase();
+        if terminal_paste_shortcut(&event.keystroke) {
+            if self.paste_terminal_from_clipboard(window, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+
         if (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
             && key == "c"
             && self.copy_terminal_selection(cx)
@@ -3309,6 +3316,33 @@ impl PuppyTermView {
 
         cx.write_to_clipboard(ClipboardItem::new_string(screen[range].to_string()));
         true
+    }
+
+    fn paste_terminal_from_clipboard(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.terminal_focus.focus(window);
+        let Some(handle) = self.active_session_handle() else {
+            return false;
+        };
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return false;
+        };
+
+        match handle.send_input(&text) {
+            Ok(()) => {
+                self.clear_terminal_selection();
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.add_log(format!("Terminal paste failed: {error}"));
+                cx.notify();
+                false
+            }
+        }
     }
 
     fn render_menu_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3827,6 +3861,60 @@ impl PuppyTermView {
                             } else {
                                 "Click inside the terminal to focus it."
                             }),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "terminal-paste-{}",
+                                        snapshot.id
+                                    )))
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(0x0f172a))
+                                    .border_1()
+                                    .border_color(rgb(0x334155))
+                                    .hover(|this| this.bg(rgb(0x1e293b)))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.paste_terminal_from_clipboard(window, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("Paste from Clipboard"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "terminal-copy-{}",
+                                        snapshot.id
+                                    )))
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(0x111827))
+                                    .border_1()
+                                    .border_color(rgb(0x334155))
+                                    .hover(|this| this.bg(rgb(0x1e293b)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.copy_terminal_selection(cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child("Copy Selection"),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
@@ -7885,6 +7973,11 @@ fn terminal_bytes_for_keystroke(event: &KeyDownEvent) -> Option<String> {
     None
 }
 
+fn terminal_paste_shortcut(keystroke: &Keystroke) -> bool {
+    (keystroke.modifiers.platform || keystroke.modifiers.control)
+        && keystroke.key.eq_ignore_ascii_case("v")
+}
+
 fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
     let mut lines = if screen.is_empty() {
         vec![String::new()]
@@ -7918,9 +8011,11 @@ fn render_terminal_cursor(screen: &str, row: u16, col: u16) -> String {
 mod tests {
     use std::fs;
 
+    use gpui::Keystroke;
+
     use super::{
         PuttyPrivateKeyInfo, convert_putty_private_key_file, parse_putty_private_key_info,
-        remove_authorized_key_entry_from_contents, render_terminal_cursor,
+        remove_authorized_key_entry_from_contents, render_terminal_cursor, terminal_paste_shortcut,
         with_replaceable_identity_targets, wrap_display_text,
     };
     use tempfile::tempdir;
@@ -7970,6 +8065,35 @@ mod tests {
             wrap_display_text("/home/teppo/.local/share/puppyterm", 12),
             "/home/teppo/\n.local/\nshare/\npuppyterm"
         );
+    }
+
+    #[test]
+    fn detects_terminal_paste_shortcut_on_platform_and_control_modifiers() {
+        let platform_v = Keystroke {
+            modifiers: gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            key: "v".into(),
+            key_char: Some("v".into()),
+        };
+        let control_v = Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "v".into(),
+            key_char: Some("v".into()),
+        };
+        let plain_v = Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key: "v".into(),
+            key_char: Some("v".into()),
+        };
+
+        assert!(terminal_paste_shortcut(&platform_v));
+        assert!(terminal_paste_shortcut(&control_v));
+        assert!(!terminal_paste_shortcut(&plain_v));
     }
 
     #[test]
